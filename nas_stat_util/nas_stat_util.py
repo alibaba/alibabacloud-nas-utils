@@ -14,7 +14,7 @@ from multiprocessing import Manager
 from queue import Queue
 from stat import S_ISREG, S_ISDIR
 
-TOOL_VERSION = "1.0"
+TOOL_VERSION = "1.1"
 INODE_LIST = 'inode_list'
 DIR_TREE = 'dir_tree'
 ALL = 'all'
@@ -119,7 +119,7 @@ def format_output_line(args, item_path, _stat=None, dir_stat=None):
                 if args.stat_type == INODE_LIST:
                     if field == 'path':
                         if args.output_without_prefix:
-                            output_parts.append(item_path.replace(args.output_without_prefix, ''))
+                            output_parts.append(item_path.replace(args.output_without_prefix, '', 1))
                         else:
                             output_parts.append(item_path)
                     elif field == 'size':
@@ -145,7 +145,7 @@ def format_output_line(args, item_path, _stat=None, dir_stat=None):
                 elif args.stat_type == DIR_TREE:
                     if field == 'path':
                         if args.output_without_prefix:
-                            output_parts.append(item_path.replace(args.output_without_prefix, ''))
+                            output_parts.append(item_path.replace(args.output_without_prefix, '', 1))
                         else:
                             output_parts.append(item_path)
                     elif field == 'inode_num':
