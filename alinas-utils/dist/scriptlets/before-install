@@ -1,0 +1,6 @@
+#!/bin/sh
+set -e
+
+#if [ "$1" = "install" ]; then
+#    sysctl -w sunrpc.tcp_slot_table_entries=128 > /dev/null 2>&1 || true
+#fi

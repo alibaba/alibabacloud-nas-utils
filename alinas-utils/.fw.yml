@@ -1,0 +1,20 @@
+---
+version: 1.0
+name: alinas-utils-rpm
+
+machine:
+  standard:
+    7u2_docker_cache:
+      - default
+
+scripts:
+  - rm -rf build
+  - make all
+
+artifacts:
+  rpms:
+    alinas-utils-generic: build/aliyun-alinas-utils.*.generic.x86_64.rpm
+    alinas-utils-al8: build/aliyun-alinas-utils.*.al8.x86_64.rpm
+    alinas-utils-el7: build/aliyun-alinas-utils.*.el7.x86_64.rpm
+    alinas-utils-el8: build/aliyun-alinas-utils.*.el8.x86_64.rpm
+    alinas-utils-deb: build/aliyun-alinas-utils.*.x86_64.deb

@@ -1,0 +1,18 @@
+#!/bin/sh
+set -e
+
+if [ "$1" = "remove" ] || [ "$1" = "purge" ]; then
+    if [ "$(cat /proc/1/comm)" = "init" ]; then
+        /sbin/stop aliyun-cpfs-mount-watchdog &> /dev/null || true
+        /sbin/stop aliyun-alinas-mount-watchdog &> /dev/null || true
+    elif [ "$(cat /proc/1/comm)" = "systemd" ]; then
+        if systemctl is-active --quiet aliyun-cpfs-mount-watchdog; then
+            systemctl --no-reload disable aliyun-cpfs-mount-watchdog.service &> /dev/null || true
+            systemctl stop aliyun-cpfs-mount-watchdog.service &> /dev/null || true
+        fi
+        if systemctl is-active --quiet aliyun-alinas-mount-watchdog; then
+            systemctl --no-reload disable aliyun-alinas-mount-watchdog.service &> /dev/null || true
+            systemctl stop aliyun-alinas-mount-watchdog.service &> /dev/null || true
+        fi
+    fi
+fi

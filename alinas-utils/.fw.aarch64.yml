@@ -1,0 +1,18 @@
+---
+version: 1.0
+name: alinas-utils-rpm
+
+machine:
+  standard:
+    arm64_dockerce_24:
+      - default
+
+scripts:
+  - rm -rf build
+  - make all-arm
+
+artifacts:
+  rpms:
+    alinas-utils-aarch64-generic: build/aliyun-alinas-utils.*.generic.aarch64.rpm
+    alinas-utils-aarch64-al8: build/aliyun-alinas-utils.*.al8.aarch64.rpm
+    alinas-utils-aarch64-deb: build/aliyun-alinas-utils.*.aarch64.deb

@@ -1,0 +1,3 @@
+# 配置需要接入ci门禁的yml文件路径，可以放多个（相对于根目录的路径），每个对应一个CI流程
+configFiles:
+ - scripts/janus-ci/release.yml

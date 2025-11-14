@@ -1,0 +1,12 @@
+*.pyc
+.DS_Store
+.idea
+.vscode
+build
+.pytest*
+.coverage
+.coverage*
+aliyun-alinas-utils/*
+aliyun-alinas-utils.spec
+aliyun-alinas-utils.tar.gz
+identifier-generator

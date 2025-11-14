@@ -1,0 +1,23 @@
+#
+# Copyright 2021-2022 Alibaba Group Holding Limited
+# Copyright 2017-2018 amazon.com, Inc. and its affiliates. All Rights Reserved.
+#
+# Licensed under the MIT License. See the LICENSE accompanying this file
+# for the specific language governing permissions and limitations under
+# the License.
+#
+
+[Unit]
+Description=aliyun-cpfs-mount-watchdog
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/env aliyun-cpfs-mount-watchdog
+KillMode=process
+Restart=always
+RestartSec=15s
+StartLimitIntervalSec=60
+StartLimitBurst=10
+
+[Install]
+WantedBy=multi-user.target

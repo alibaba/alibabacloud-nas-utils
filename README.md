@@ -10,6 +10,8 @@ The alibabacloud-nas-utils project is an open-source set of professional tools r
 
 ### 1. NAS Capacity Statistics Tool ([nas_stat_util](nas_stat_util/README.md))
 Used to analyze and statistics directory-level capacity usage of NAS filesystems, supporting multiple filtering conditions and output formats.
+### 2. Alinas Utils ([alinas-utils](alinas-utils/README.md))
+Utilities for Aliyun Alinas File System (alinas).
 
 ## Usage
 

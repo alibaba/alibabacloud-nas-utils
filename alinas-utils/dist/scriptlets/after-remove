@@ -1,0 +1,22 @@
+#!/bin/sh
+set -e
+
+reload() {
+    if [ "$(cat /proc/1/comm)" = "systemd" ]; then
+        systemctl daemon-reload
+        systemctl reset-failed
+    fi
+    ps -eww -o pid,cmd,args | grep /usr/local/nas-agent/nas-agent | grep -vw grep | awk '{print $1}' | xargs -I {} kill -9 {}
+}
+
+if [ "$1" = "remove" ]; then
+    reload
+elif [ "$1" = "purge" ]; then
+    rm -f /var/log/aliyun/cpfs/*
+    rm -rf /var/log/aliyun/alinas/nas-agent
+    rm -rf /usr/local/nas-agent
+    rm -rf /etc/nas-agent
+    rm -rf /etc/aliyun/alinas/nas-agent-commands-remote
+    rm -f /etc/aliyun/alinas/last-mountpoint
+    reload
+fi

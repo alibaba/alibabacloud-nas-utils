@@ -1,0 +1,341 @@
+#! /usr/bin/env python
+# -*- python-mode -*-
+""" Show NFS iostat information by parsing /proc/self/mountstats
+"""
+
+from __future__ import print_function
+
+import sys, os, time
+from optparse import OptionParser
+
+NfsEventCounters = [
+    'inoderevalidates',
+    'dentryrevalidates',
+    'datainvalidates',
+    'attrinvalidates',
+    'vfsopen',
+    'vfslookup',
+    'vfspermission',
+    'vfsupdatepage',
+    'vfsreadpage',
+    'vfsreadpages',
+    'vfswritepage',
+    'vfswritepages',
+    'vfsreaddir',
+    'vfssetattr',
+    'vfsflush',
+    'vfsfsync',
+    'vfslock',
+    'vfsrelease',
+    'congestionwait',
+    'setattrtrunc',
+    'extendwrite',
+    'sillyrenames',
+    'shortreads',
+    'shortwrites',
+    'delay'
+]
+
+NfsByteCounters = [
+    'normalreadbytes',
+    'normalwritebytes',
+    'directreadbytes',
+    'directwritebytes',
+    'serverreadbytes',
+    'serverwritebytes',
+    'readpages',
+    'writepages'
+]
+
+class DeviceData:
+    """DeviceData objects provide methods for parsing and displaying
+    data for a single mount grabbed from /proc/self/mountstats
+    """
+
+    def __init__(self):
+        self.__nfs_data = dict()
+        self.__rpc_data = dict()
+        self.__rpc_data['ops'] = []
+
+    def __parse_nfs_line(self, words):
+        if words[0] == 'device':
+            self.__nfs_data['export'] = words[1]
+            self.__nfs_data['mountpoint'] = words[4]
+            self.__nfs_data['fstype'] = words[7]
+            if words[7] == 'nfs':
+                self.__nfs_data['statvers'] = words[8]
+        elif 'nfs' in words or 'nfs4' in words:
+            self.__nfs_data['export'] = words[0]
+            self.__nfs_data['mountpoint'] = words[3]
+            self.__nfs_data['fstype'] = words[6]
+            if words[6] == 'nfs':
+                self.__nfs_data['statvers'] = words[7]
+        elif words[0] == 'age:':
+            self.__nfs_data['age'] = int(words[1])
+        elif words[0] == 'opts:':
+            self.__nfs_data['mountoptions'] = ''.join(words[1:]).split(',')
+        elif words[0] == 'caps:':
+            self.__nfs_data['servercapabilities'] = ''.join(words[1:]).split(',')
+        elif words[0] == 'nfsv4:':
+            self.__nfs_data['nfsv4flags'] = ''.join(words[1:]).split(',')
+        elif words[0] == 'sec:':
+            keys = ''.join(words[1:]).split(',')
+            self.__nfs_data['flavor'] = int(keys[0].split('=')[1])
+            self.__nfs_data['pseudoflavor'] = 0
+            if self.__nfs_data['flavor'] == 6:
+                self.__nfs_data['pseudoflavor'] = int(keys[1].split('=')[1])
+        elif words[0] == 'events:':
+            i = 1
+            for key in NfsEventCounters:
+                self.__nfs_data[key] = int(words[i])
+                i += 1
+        elif words[0] == 'bytes:':
+            i = 1
+            for key in NfsByteCounters:
+                self.__nfs_data[key] = int(words[i])
+                i += 1
+
+    def __parse_rpc_line(self, words):
+        if words[0] == 'RPC':
+            self.__rpc_data['statsvers'] = float(words[3])
+            self.__rpc_data['programversion'] = words[5]
+        elif words[0] == 'xprt:':
+            self.__rpc_data['protocol'] = words[1]
+            if words[1] == 'udp':
+                self.__rpc_data['port'] = int(words[2])
+                self.__rpc_data['bind_count'] = int(words[3])
+                self.__rpc_data['rpcsends'] = int(words[4])
+                self.__rpc_data['rpcreceives'] = int(words[5])
+                self.__rpc_data['badxids'] = int(words[6])
+                self.__rpc_data['inflightsends'] = int(words[7])
+                self.__rpc_data['backlogutil'] = int(words[8])
+            elif words[1] == 'tcp':
+                self.__rpc_data['port'] = words[2]
+                self.__rpc_data['bind_count'] = int(words[3])
+                self.__rpc_data['connect_count'] = int(words[4])
+                self.__rpc_data['connect_time'] = int(words[5])
+                self.__rpc_data['idle_time'] = int(words[6])
+                self.__rpc_data['rpcsends'] = int(words[7])
+                self.__rpc_data['rpcreceives'] = int(words[8])
+                self.__rpc_data['badxids'] = int(words[9])
+                self.__rpc_data['inflightsends'] = int(words[10])
+                self.__rpc_data['backlogutil'] = int(words[11])
+                if len(words) > 14:
+                    self.__rpc_data['maxslots'] = int(words[12])
+                    self.__rpc_data['sendutil'] = int(words[13])
+                    self.__rpc_data['pendutil'] = int(words[14])
+                else:
+                    self.__rpc_data['maxslots'] = -1
+                    self.__rpc_data['sendutil'] = 0
+                    self.__rpc_data['pendutil'] = 0
+            elif words[1] == 'rdma':
+                self.__rpc_data['port'] = words[2]
+                self.__rpc_data['bind_count'] = int(words[3])
+                self.__rpc_data['connect_count'] = int(words[4])
+                self.__rpc_data['connect_time'] = int(words[5])
+                self.__rpc_data['idle_time'] = int(words[6])
+                self.__rpc_data['rpcsends'] = int(words[7])
+                self.__rpc_data['rpcreceives'] = int(words[8])
+                self.__rpc_data['badxids'] = int(words[9])
+                self.__rpc_data['backlogutil'] = int(words[10])
+                self.__rpc_data['read_chunks'] = int(words[11])
+                self.__rpc_data['write_chunks'] = int(words[12])
+                self.__rpc_data['reply_chunks'] = int(words[13])
+                self.__rpc_data['total_rdma_req'] = int(words[14])
+                self.__rpc_data['total_rdma_rep'] = int(words[15])
+                self.__rpc_data['pullup'] = int(words[16])
+                self.__rpc_data['fixup'] = int(words[17])
+                self.__rpc_data['hardway'] = int(words[18])
+                self.__rpc_data['failed_marshal'] = int(words[19])
+                self.__rpc_data['bad_reply'] = int(words[20])
+        elif words[0] == 'per-op':
+            self.__rpc_data['per-op'] = words
+        else:
+            op = words[0][:-1]
+            self.__rpc_data['ops'] += [op]
+            self.__rpc_data[op] = [int(word) for word in words[1:]]
+
+    def parse_stats(self, lines):
+        """Turn a list of lines from a mount stat file into a
+        dictionary full of stats, keyed by name
+        """
+        found = False
+        for line in lines:
+            words = line.split()
+            if len(words) == 0:
+                continue
+            if (not found and words[0] != 'RPC'):
+                self.__parse_nfs_line(words)
+                continue
+
+            found = True
+            self.__parse_rpc_line(words)
+
+    def is_nfs_mountpoint(self):
+        """Return True if this is an NFS or NFSv4 mountpoint,
+        otherwise return False
+        """
+        if self.__nfs_data['fstype'] == 'nfs':
+            return True
+        elif self.__nfs_data['fstype'] == 'nfs4':
+            return True
+        return False
+
+    def __print_rpc_op_stats(self, op):
+        """Print generic stats for one RPC op
+        """
+        if op not in self.__rpc_data:
+            return
+
+        rpc_stats = self.__rpc_data[op]
+        ops = float(rpc_stats[0])
+        retrans = float(rpc_stats[1] - rpc_stats[0])
+        kilobytes = float(rpc_stats[3] + rpc_stats[4]) / 1024
+        queued_for = float(rpc_stats[5])
+        rtt = float(rpc_stats[6])
+        exe = float(rpc_stats[7])
+        if len(rpc_stats) >= 9:
+            errs = float(rpc_stats[8])
+
+        print(format(op.lower(), '<16s'), end='')
+        print(format(ops, '>8.0f'), end='')
+        print(format(kilobytes, '>16.3f'), end='')
+        print(format(retrans, '>16'), end='')
+        print(format(rtt, '>16.3f'), end='')
+        print(format(exe, '>16.3f'), end='')
+        print(format(queued_for, '>16.3f'), end='')
+        print()
+
+    def display_iostats(self):
+        """Display NFS and RPC stats in an iostat-like way
+        """
+        sends = self.__rpc_data['rpcsends']
+        inflight = self.__rpc_data['inflightsends']
+        backlog = self.__rpc_data['backlogutil']
+        sendqueue = self.__rpc_data['sendutil']
+        pendqueue = self.__rpc_data['pendutil']
+
+        concurrency, pendqueue = backlog + sendqueue + max(pendqueue, inflight), inflight
+
+        max_slots = self.__rpc_data['maxslots']
+        if max_slots == -1:
+            concurrency = -1
+            sendqueue = -1
+
+        print()
+        print('%s mounted on %s: max_slots: %s' % (self.__nfs_data['export'], self.__nfs_data['mountpoint'], max_slots))
+        print()
+
+        print(format('ops', '>16')
+              + format('concurrency', '>16')
+              + format('bklogqueue', '>16')
+              + format('sendqueue', '>16')
+              + format('pendqueue', '>16'))
+        print(format(sends, '>16.0f'), end='')
+        print(format(concurrency, '>16.0f'), end='')
+        print(format(backlog, '>16.0f'), end='')
+        print(format(sendqueue, '>16.0f'), end='')
+        print(format(pendqueue, '>16.0f'), end='')
+        print()
+
+        print(format('op', '<16s'), end='')
+        print(format('ops', '>8s'), end='')
+        print(format('kB', '>16s'), end='')
+        print(format('retrans', '>16s'), end='')
+        print(format('RTT (ms)', '>16s'), end='')
+        print(format('exe (ms)', '>16s'), end='')
+        print(format('queue (ms)', '>16s'), end='')
+        print()
+
+        if self.__nfs_data['fstype'] == 'nfs':
+            self.__print_rpc_op_stats('GETATTR')
+            self.__print_rpc_op_stats('SETATTR')
+            self.__print_rpc_op_stats('LOOKUP')
+            self.__print_rpc_op_stats('READLINK')
+            self.__print_rpc_op_stats('FSSTAT')
+            self.__print_rpc_op_stats('READ')
+            self.__print_rpc_op_stats('WRITE')
+            self.__print_rpc_op_stats('REMOVE')
+            self.__print_rpc_op_stats('RENAME')
+            self.__print_rpc_op_stats('LINK')
+
+            self.__print_rpc_op_stats('READDIR')
+            self.__print_rpc_op_stats('READDIRPLUS')
+
+            self.__print_rpc_op_stats('MKNOD')
+            self.__print_rpc_op_stats('CREATE')
+            self.__print_rpc_op_stats('MKDIR')
+
+
+        elif self.__nfs_data['fstype'] == 'nfs4':
+            self.__print_rpc_op_stats('GETATTR')
+            self.__print_rpc_op_stats('SETATTR')
+            self.__print_rpc_op_stats('LOOKUP')
+            self.__print_rpc_op_stats('READLINK')
+            self.__print_rpc_op_stats('STATFS')
+            self.__print_rpc_op_stats('READ')
+            self.__print_rpc_op_stats('WRITE')
+            self.__print_rpc_op_stats('REMOVE')
+            self.__print_rpc_op_stats('RENAME')
+            self.__print_rpc_op_stats('LINK')
+            self.__print_rpc_op_stats('READDIR')
+            self.__print_rpc_op_stats('CREATE')
+
+            self.__print_rpc_op_stats('OPEN')
+            self.__print_rpc_op_stats('CLOSE')
+
+        sys.stdout.flush()
+
+#
+# Functions
+#
+
+def parse_stats_file(filename):
+    """pop the contents of a mountstats file into a dictionary,
+    keyed by mount point.  each value object is a list of the
+    lines in the mountstats file corresponding to the mount
+    point named in the key.
+    """
+    ms_dict = dict()
+    key = ''
+
+    f = open(filename)
+    for line in f.readlines():
+        words = line.split()
+        if len(words) == 0:
+            continue
+        if line.startswith("no device mounted"):
+            continue
+        if words[0] == 'device':
+            key = words[4]
+            new = [line.strip()]
+        elif 'nfs' in words or 'nfs4' in words:
+            key = words[3]
+            new = [line.strip()]
+        else:
+            new += [line.strip()]
+        ms_dict[key] = new
+    f.close()
+
+    return ms_dict
+
+def print_iostat_summary(mountstats, device, options):
+    stats = DeviceData()
+    stats.parse_stats(mountstats[device])
+    if not stats.is_nfs_mountpoint():
+        print('Not NFS mount point')
+        return
+    stats.display_iostats()
+
+#
+# Main
+#
+
+parser = OptionParser(usage="usage: %prog [ <mount point> ]")
+(options, args) = parser.parse_args(sys.argv)
+device = args[1]
+
+mountstats = parse_stats_file('/proc/self/mountstats')
+print_iostat_summary(mountstats, device, options)
+
+sys.exit(0)

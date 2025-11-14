@@ -1,0 +1,25 @@
+#
+# Copyright 2020-2021 Alibaba Group Holding Limited
+# Copyright 2017-2018 amazon.com, Inc. and its affiliates. All Rights Reserved.
+#
+# Licensed under the MIT License. See the LICENSE accompanying this file
+# for the specific language governing permissions and limitations under
+# the License.
+#
+
+[Unit]
+Description=aliyun-alinas-mount-watchdog
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/env aliyun-alinas-mount-watchdog
+ExecStopPost=/usr/bin/bash -c "ps -eww -o pid,cmd,args | grep /usr/local/nas-agent/nas-agent | grep -vw grep | awk '{print $1}' | xargs -I {} kill -9 {}"
+KillMode=process
+KillSignal=SIGKILL
+Restart=always
+RestartSec=15s
+StartLimitIntervalSec=60
+StartLimitBurst=10
+
+[Install]
+WantedBy=multi-user.target

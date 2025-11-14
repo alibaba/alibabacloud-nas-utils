@@ -1,0 +1,33 @@
+#!/bin/sh
+set -e
+
+if [ -z "$2" ]; then
+    # for install
+    if [ "$(cat /proc/1/comm)" = "init" ]; then
+        ps -eww -o pid,cmd,args | grep -vw grep | grep haproxy | grep cpfs.aliyuncs.com
+        if [ $? -eq 0 ]; then
+            /sbin/restart aliyun-cpfs-mount-watchdog &> /dev/null || true
+        fi
+    elif [ "$(cat /proc/1/comm)" = "systemd" ]; then
+        set +e
+        ps -eww -o pid,cmd,args | grep -vw grep | grep haproxy | grep cpfs.aliyuncs.com
+        if [ $? -eq 0 ]; then
+            /bin/systemctl enable aliyun-cpfs-mount-watchdog.service &> /dev/null || true
+            /bin/systemctl start aliyun-cpfs-mount-watchdog.service &> /dev/null || true
+        fi
+    fi
+else
+    # for upgrade
+    set -e
+    if [ "$(cat /proc/1/comm)" = "init" ]; then
+        /sbin/restart aliyun-cpfs-mount-watchdog &> /dev/null || true
+        /sbin/restart aliyun-alinas-mount-watchdog &> /dev/null || true
+    elif [ "$(cat /proc/1/comm)" = "systemd" ]; then
+        if systemctl is-active --quiet aliyun-cpfs-mount-watchdog; then
+            systemctl try-restart aliyun-cpfs-mount-watchdog.service &> /dev/null || true
+        fi
+        if systemctl is-active --quiet aliyun-alinas-mount-watchdog; then
+            systemctl try-restart aliyun-alinas-mount-watchdog.service &> /dev/null || true
+        fi
+    fi
+fi

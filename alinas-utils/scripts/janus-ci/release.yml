@@ -1,0 +1,22 @@
+version: v1
+metadata:
+  name: janus-ci
+  namespace: nas
+  image: 'reg.docker.alibaba-inc.com/nas_test/nas10-build:202401231600'
+  verifyLabel: Nas-1.0-mag
+  arch: x86_64
+  language: c++
+  env:
+    LOGROOT: ../logs
+    ALIMAKE_MODE: release
+    SOURCE_DIR: /code
+checkout:
+  cpu: 2
+  mem: 4
+  submodule: false
+  depth: 15
+  precheck_submit_forbid: false
+splc:
+  cpu: 2
+  mem: 2
+  timeout: 30
