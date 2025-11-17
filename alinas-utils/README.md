@@ -49,6 +49,11 @@ $ ./build-deb.sh
 $ sudo apt-get -y install ./build/aliyun-alinas-utils*noarch.deb
 ```
 
+for alinas use git-lfs to download the [nas-agent_aarch64](src/alinas/nas_agent/nas-agent_aarch64)
+```
+$ git lfs pull
+```
+
 ## Usage
 
 ### mount.alinas
