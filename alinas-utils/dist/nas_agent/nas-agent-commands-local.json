@@ -143,7 +143,15 @@
         "efc_process_shmem_util": {
             "version": "0.0.1",
             "client_type": "efc",
-            "task": "du -k /dev/shm/*<uuid>* | awk '{ sum += $1 } END { print sum }'",
+            "task": "(du -k /dev/shm/*<uuid>* | awk '{ sum += $1 } END { print sum }'; names='fh file journal page volume'; for name in ${names}; do path=/dev/shm/${name}_<uuid>; if [ -f ${path} ]; then du -k ${path} | awk '{ print $1 }'; else echo 0; fi; done) | tr '\\n' ' '",
+            "rules": [
+                { "name": "efc_process_shmem_util", "index": 1, "type": "raw" },
+                { "name": "filehandle", "index": 2, "type": "raw" },
+                { "name": "file", "index": 3, "type": "raw" },
+                { "name": "journal", "index": 4, "type": "raw" },
+                { "name": "page", "index": 5, "type": "raw" },
+                { "name": "volume", "index": 6, "type": "raw" }
+            ],
             "interval": 10,
             "description": "the shared memory utilization for efc process"
         },

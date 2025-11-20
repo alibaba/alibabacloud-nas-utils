@@ -947,7 +947,7 @@ def parse_val_from_kvstr(kvstr, key, default_val):
 
 def get_unas_mem_limit(mount_options):
     server = parse_val_from_kvstr(mount_options, 'server', '').split(':')[0]
-    if server.endswith('.cpfs.aliyuncs.com'):
+    if server.endswith('.cpfs.aliyuncs.com') or '.oss-' in server:
         limit_size = sys.maxsize
     else:
         limit_size = CGROUP_BASE_MEMORY_LIMIT_SIZE

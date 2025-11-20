@@ -2764,7 +2764,7 @@ def mount_bindroot(ctx, mount_uuid, is_upgrade, sessmgr_required):
         fatal_error('Mount bindroot %s failed: msg=%s' % (ctx.dns, str(e)))
 
 def get_unas_mem_limit(ctx):
-    if ctx.dns.endswith('.cpfs.aliyuncs.com'):
+    if ctx.dns.endswith('.cpfs.aliyuncs.com') or '.oss-' in ctx.dns:
         limit_size = sys.maxsize
     else:
         limit_size = CGROUP_BASE_MEMORY_LIMIT_SIZE

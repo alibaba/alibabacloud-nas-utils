@@ -75,7 +75,7 @@ specfile: clean
 sources: tarball specfile
 
 .PHONY: rpm-only
-rpm-only: rpm-only-generic rpm-only-al7 rpm-only-al8 rpm-only-el7 rpm-only-el8
+rpm-only: rpm-only-generic rpm-only-al7 rpm-only-al8 rpm-only-el7 rpm-only-el8 rpm-only-lp15
 
 .PHONY: rpm-only-al7
 rpm-only-al7:
@@ -129,6 +129,19 @@ rpm-only-el8:
 	--define "dist .el8" \
 	--define "arch x86_64"
 	cp $(BUILD_DIR)/RPMS/*/*.el8.*rpm build
+
+.PHONY: rpm-only-lp15
+rpm-only-lp15:
+	mkdir -p $(BUILD_DIR)/{SPECS,COORD_SOURCES,DATA_SOURCES,BUILD,RPMS,SOURCES,SRPMS}
+	cp $(SPECFILE) $(BUILD_DIR)/SPECS
+	cp $(SOURCE_TARBALL) $(BUILD_DIR)/SOURCES
+	rpmbuild -ba $(BUILD_DIR)/SPECS/$(SPECFILE) \
+	--define "_topdir `pwd`/$(BUILD_DIR)" \
+	--define "version `cat VERSION|awk -F- '{print $$1}'`" \
+	--define "build_id `cat VERSION|awk -F- '{print $$2}'`.$(BUILD_ID)" \
+	--define "dist .lp15" \
+	--define "arch x86_64"
+	cp $(BUILD_DIR)/RPMS/*/*.lp15.*rpm build
 
 .PHONY: rpm-only-generic
 rpm-only-generic:

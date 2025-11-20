@@ -35,6 +35,7 @@ import logging
 import os
 import random
 import re
+import shutil
 import site
 import socket
 import subprocess
@@ -107,7 +108,8 @@ ALINAS_ONLY_OPTIONS = [
     # When using alinas-utils in containerized environment, watchdog can not be started using init or systemd
     # and there should be an external manager process responsible for starting watchdog.
     'no_start_watchdog',
-    'alitimeo'
+    'alitimeo',
+    'hp_config_dir' # To specify ha proxy config path.
 ]
 
 UNSUPPORTED_OPTIONS = [
@@ -414,7 +416,7 @@ def resolve_dns(dns):
         fatal_error('Failed to resolve dns: {0}'.format(dns))
 
 
-def write_haproxy_config_file(_, state_file_dir, dns, proxy_ip, proxy_port, remote, backup, options, is_ssl=False):
+def write_haproxy_config_file(_, hp_config_dir, dns, proxy_ip, proxy_port, remote, backup, options, is_ssl=False):
     """
     Serializes haproxy configuration to a file. Unfortunately this does not conform to Python's config file format,
     so we have to hand-serialize it.
@@ -422,12 +424,20 @@ def write_haproxy_config_file(_, state_file_dir, dns, proxy_ip, proxy_port, remo
     if is_ssl and not os.path.exists(DEFAULT_STUNNEL_CAFILE):
         fatal_error('Failed to find the alinas certificate authority file for verification',
                     'Failed to find the alinas CAfile "%s"' % DEFAULT_STUNNEL_CAFILE)
-    CA_file = DEFAULT_STUNNEL_CAFILE
+    # Move CA file to the same folder as hp_config_dir in case security enhancement limits the location to read crt
+    CA_file_name = os.path.basename(DEFAULT_STUNNEL_CAFILE)
+    CA_file = os.path.join(hp_config_dir, CA_file_name)
+    try:
+        shutil.copy2(DEFAULT_STUNNEL_CAFILE, CA_file)
+        logging.debug("Copy file from %s to %s succeeded.", DEFAULT_STUNNEL_CAFILE, CA_file)
+    except Exception as e:
+        logging.debug("Copy file from %s to %s failed with exception as %s.", DEFAULT_STUNNEL_CAFILE, CA_file, str(e))
+        CA_file = DEFAULT_STUNNEL_CAFILE
 
     haproxy_config = make_config(proxy_ip, proxy_port, remote, backup, options, is_ssl, CA_file)
     logging.debug('Write haproxy configuration:\n%s', haproxy_config)
 
-    haproxy_config_file = os.path.join(state_file_dir, 'haproxy-config.%s' % dns)
+    haproxy_config_file = os.path.join(hp_config_dir, 'haproxy-config.%s' % dns)
 
     with open(haproxy_config_file, 'w') as f:
         f.write(haproxy_config)
@@ -496,13 +506,26 @@ def write_state_file(local_dns, ctx, tunnel_pid, command, config_file, files, st
 
     return state_file
 
+def classify_haproxy_error(error_msg):
+    # permission level
+    if re.search(rb'permission denied|operation not permitted', error_msg, re.IGNORECASE):
+        if re.search(rb'config', error_msg, re.IGNORECASE):
+            return "Permission denied for reading configuration file. Please check security configuration or use another configuration path."
+        else:
+            return "Permission denied or Operation not permitted for ha proxy."
+    
+    return None
+
 
 def test_proxy_process(proxy_name, proxy_proc, fs_id):
     proxy_proc.poll()
 
     if proxy_proc.returncode is not None:
         out, err = proxy_proc.communicate()
-        user_msg = 'Failed to initialize proxy %s for %s' % (proxy_name, fs_id)
+        err_parsed = classify_haproxy_error(err.strip())
+        user_msg = 'Failed to initialize proxy %s for %s.' % (proxy_name, fs_id)
+        if err_parsed is not None:
+            user_msg += 'Error Msg is %s.' % (err_parsed)
         log_msg = 'Failed to start proxy %s (errno=%d). stdout="%s" stderr="%s"' % \
                   (proxy_name, proxy_proc.returncode, out.strip(), err.strip())
         fatal_error(user_msg, log_msg)
@@ -758,7 +781,12 @@ def bootstrap_proxy(config, dns_name, options, state_file_dir=STATE_FILE_DIR, is
     remote = options['nas_ip']
     backup = options['backup_ip']
 
-    proxy_config_file = write_haproxy_config_file(config, state_file_dir, dns_name, proxy, port, remote, backup, options, is_ssl)
+    # ha proxy config dir choose: customer specify in options -> apparmor whitelisted path -> default
+    hp_config_dir = load_ha_proxy_path(options, os.path.join('/etc/apparmor.d', 'usr.sbin.haproxy'), state_file_dir)
+    
+    logging.debug('haproxy config dir value is %s', hp_config_dir)
+
+    proxy_config_file = write_haproxy_config_file(config, hp_config_dir, dns_name, proxy, port, remote, backup, options, is_ssl)
 
     # the env is required, or the popen cannot find haproxy in some OS, I don't know why
     env = {'PATH': '/usr/sbin:/sbin:/usr/bin:/usr/local/bin:/usr/local/sbin'}
@@ -774,6 +802,52 @@ def bootstrap_proxy(config, dns_name, options, state_file_dir=STATE_FILE_DIR, is
     logging.info('Started haproxy, pid: %d', proxy_proc.pid)
 
     return proxy_config_file, proxy_proc, proxy_args
+
+def get_apparmor_enforced_dir(profile_path):
+    if not os.path.exists(profile_path):
+        logging.debug('Trying to get apparmor dir, didn\'t find file path at %s', profile_path)
+        return None
+
+    readable_dirs = set()
+
+    with open(profile_path, 'r') as f:
+        lines = f.readlines()
+
+    for line in lines:
+        line = line.strip()
+        
+        # skip comment line
+        if not line or line.startswith('#'):
+            continue
+        
+        # regex to match path + permission
+        match = re.match(r'^(\S+)\s+([rwkldmxiuc]+),?\s*$', line)
+        if not match:
+            continue
+        
+        path_pattern = match.group(1)
+        permissions = match.group(2)
+        
+        if 'r' in permissions:
+            # if path ends with '/' and ends with '/*'
+            if path_pattern.endswith('/'):
+                readable_dirs.add(path_pattern)
+            elif path_pattern.endswith('/*'):
+                readable_dirs.add(path_pattern[:-1])
+            else:
+                pass
+    
+    return next(iter(readable_dirs), None)
+
+
+ # ha proxy config dir choose: customer specify in options -> apparmor whitelisted path -> default
+def load_ha_proxy_path(options, apparmor_ha_profile, default_config_dir):
+    hp_config_dir = options.get('hp_config_dir')
+    if hp_config_dir is None:
+        hp_config_dir = get_apparmor_enforced_dir(apparmor_ha_profile)
+    if hp_config_dir is None:
+        hp_config_dir = default_config_dir
+    return hp_config_dir
 
 
 def is_same_dns(nas_dns, state_file_dir=STATE_FILE_DIR):
