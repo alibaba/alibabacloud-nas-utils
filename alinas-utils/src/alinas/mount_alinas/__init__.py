@@ -283,6 +283,7 @@ ALINAS_ONLY_OPTIONS = [
     'ram',
     'ram_config_file',
     'tls_ciphers',
+    'no_add_cgroup',
     UNAS_APP_NAME,
     BIND_TAG
 ]
@@ -2785,6 +2786,10 @@ def get_unas_file_open_max_size(ctx):
 
 def add_cgroup_limit(ctx, mount_uuid, cgroup_dir=CGROUP_DIR):
     try:
+        if 'no_add_cgroup' in ctx.options:
+            logging.info("no_add_cgroup in mount options, skip add %s into cgroup limit" % mount_uuid)
+            return
+
         res = os.popen("cat /proc/mounts | grep cgroup | grep memory | tr ',' ' ' | awk '{print $4}'").read().strip()
         if res == 'ro':
             logging.info("/sys/fs/cgroup/memory mounts as read-only filesystem, skip add %s into cgroup limit" % mount_uuid)

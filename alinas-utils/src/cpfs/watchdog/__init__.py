@@ -182,6 +182,11 @@ def check_alinas_mounts(watchdog, unmount_grace_period_sec, state_file_dir=STATE
                 if 'unmount_time' in state:
                     if state['unmount_time'] + unmount_grace_period_sec < current_time:
                         logging.info('Unmount grace period expired for %s', state_file)
+                        if 'hp_terminating' not in state:
+                            state['hp_terminating'] = True
+                            logging.debug('Marking ha proxy for %s as terminated', state_file)
+                            cpfs_nfs_common.rewrite_state_file(state, STATE_FILE_DIR, state_file)
+                            logging.info('rewrite state file:{}'.format(state))
                         clean_up_mount_state(state_file_dir, state_file, state['pid'], is_running)
 
                 elif local_dns not in nfs_mounts:

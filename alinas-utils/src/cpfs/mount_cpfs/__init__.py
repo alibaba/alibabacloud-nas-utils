@@ -850,13 +850,17 @@ def load_ha_proxy_path(options, apparmor_ha_profile, default_config_dir):
     return hp_config_dir
 
 
-def is_same_dns(nas_dns, state_file_dir=STATE_FILE_DIR):
+def should_reuse_proxy(nas_dns, state_file_dir=STATE_FILE_DIR):
     try:
         state = cpfs_nfs_common.load_state_file(state_file_dir, nas_dns)
         if not state:
             return False
         state_dns = state['nas_dns']
-        if nas_dns == state_dns:
+        ha_proxy_terminating = False
+        if 'hp_terminating' in state:
+            logging.debug('Failed to reuse proxy because it is terminating.')
+            ha_proxy_terminating = True
+        if nas_dns == state_dns and not ha_proxy_terminating:
             return True
         else:
             return False
@@ -1108,7 +1112,7 @@ def main():
 
     else:
         with cpfs_nfs_common.lock_file(dns_name) as _:
-            if is_same_dns(dns_name):
+            if should_reuse_proxy(dns_name):
                 mount_nfs_reuse_proxy(ctx)
             else:
                 mount_nfs_proxy(ctx)

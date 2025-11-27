@@ -1742,7 +1742,12 @@
                 { "name": "write_ops", "index": 36, "type": "raw" },
                 { "name": "inflight_tasks", "index": 37, "type": "raw" },
                 { "name": "inflight_chunks", "index": 38, "type": "raw" },
-                { "name": "concurrent_tasks", "index": 39, "type": "raw" }
+                { "name": "concurrent_tasks", "index": 39, "type": "compute" },
+                { "name": "prefetch_hit_qps", "index": 40, "type": "compute" },
+                { "name": "prefetch_hit_throughtput", "index": 41, "type": "compute" },
+                { "name": "prefetch_read_source_qps", "index": 42, "type": "compute" },
+                { "name": "prefetch_read_source_throughput", "index": 43, "type": "compute" },
+                { "name": "prefetch_read_source_avg_lat", "index": 44, "type": "compute" }
             ],
             "interval": 10,
             "description": "tier dadi information"

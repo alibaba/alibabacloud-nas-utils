@@ -12,7 +12,8 @@ The `alinas-utils` package has been verified against the following Linux distrib
 | CentOS 8 | `rpm` | `systemd` |
 | RHEL 7 | `rpm`| `systemd` |
 | RHEL 8 | `rpm`| `systemd` |
-| SUSE 15 | `rpm`| `systemd` |
+| OpenSUSE Leap | `rpm`| `systemd` |
+| SLES 15 | `rpm`| `systemd` |
 | Debian 9 | `deb` | `systemd` |
 | Debian 10 | `deb` | `systemd` |
 | Ubuntu 16.04 | `deb` | `systemd` |
@@ -22,9 +23,11 @@ The `alinas-utils` package has been verified against the following Linux distrib
 ## Prerequisites
 
 * `nfs-utils` (RHEL/CentOS/Aliyun Linux) or `nfs-common` (Debian/Ubuntu)
-* OpenSSL 1.0.2+
-* Python 3.4+
+* `OpenSSL` 1.0.2+
+* `Python` 3.4+
 * `stunnel` 4.56+
+* `haproxy` 1.5.0+
+* `bind-utils`
 
 ## Installation
 
@@ -40,11 +43,11 @@ $ make rpm
 $ sudo yum -y install build/aliyun-alinas-utils*generic.x86_64.rpm
 ```
 
-- To build and install an RPM for SUSE:
+- To build and install an RPM for OpenSUSE/SLES:
 
 ```
 $ sudo zypper refresh
-$ sudo zypper install -y git rpm-build make gcc-g++ # remove gcc-g++ here if you already installed a compatible version following GCC Version Requirements instruction
+$ sudo zypper install -y git rpm-build make gcc-c++ # remove gcc-c++ here if you already installed a compatible version following GCC Version Requirements instruction
 $ git clone https://github.com/alibaba/alibabacloud-nas-utils.git
 $ cd alinas-utils
 $ make rpm
