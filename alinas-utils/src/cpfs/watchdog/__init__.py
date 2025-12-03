@@ -162,7 +162,7 @@ def restart_proxy(child_procs, state, state_file_dir, state_file):
         raise
 
 
-def check_alinas_mounts(watchdog, unmount_grace_period_sec, state_file_dir=STATE_FILE_DIR):
+def check_alinas_mounts(watchdog, unmount_grace_period_sec_cfg, state_file_dir=STATE_FILE_DIR):
     nfs_mounts = cpfs_nfs_common.get_current_local_nfs_mounts()
     logging.debug('Current local NFS mounts: %s', list(nfs_mounts.values()))
 
@@ -180,6 +180,7 @@ def check_alinas_mounts(watchdog, unmount_grace_period_sec, state_file_dir=STATE
 
                 current_time = time.time()
                 if 'unmount_time' in state:
+                    unmount_grace_period_sec = int(state.get('unmount_grace_period_sec', unmount_grace_period_sec_cfg))
                     if state['unmount_time'] + unmount_grace_period_sec < current_time:
                         logging.info('Unmount grace period expired for %s', state_file)
                         if 'hp_terminating' not in state:

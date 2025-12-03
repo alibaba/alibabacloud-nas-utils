@@ -260,11 +260,18 @@ def try_update_haproxy_config_line(line, server_type, old_server, new_server):
     line = line.replace(params[2], new_server)
     return line
 
+def get_haproxy_config_file_path(domain, state_file_dir=STATE_FILE_DIR):
+    state = load_state_file(state_file_dir, domain)
+    if 'config_file' in state:
+        return state['config_file']
+    else:
+        return os.path.join(STATE_FILE_DIR, 'haproxy-config.%s' % domain)
 
 def update_haproxy_config_file(local_dns, old_primary_server, old_backup_server, new_primary_server, new_backup_server, state_file_dir=STATE_FILE_DIR):
     config_data = ""
-    haproxy_config_file = os.path.join(state_file_dir, 'haproxy-config.%s' % local_dns)
-    tmp_haproxy_config_file = os.path.join(state_file_dir, '~haproxy-config.%s' % local_dns)
+    haproxy_config_file = get_haproxy_config_file_path(local_dns)
+    tmp_haproxy_file_name = '~' + os.path.basename(haproxy_config_file)
+    tmp_haproxy_config_file = os.path.join(os.path.dirname(haproxy_config_file), tmp_haproxy_file_name)
     try:
         with lock_file(local_dns) as _:
             with open(haproxy_config_file, 'r') as f:

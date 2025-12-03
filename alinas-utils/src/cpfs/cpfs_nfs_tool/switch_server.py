@@ -85,7 +85,7 @@ def update_alicpfs_server(local_dns, old_primary_server, old_backup_server, new_
 def get_haproxy_server(local_dns, state_file_dir=STATE_FILE_DIR):
     primary_server = ''
     backup_server = ''
-    haproxy_config_file = os.path.join(state_file_dir, 'haproxy-config.%s' % local_dns)
+    haproxy_config_file = cpfs_nfs_common.get_haproxy_config_file_path(local_dns, state_file_dir)
     try:
         with open(haproxy_config_file, 'r') as f:
             for line in f:
@@ -131,7 +131,7 @@ def check_domain(domain):
 def check_arguments(args):
     check_domain(args.domain)
 
-    haproxy_config_file = os.path.join(STATE_FILE_DIR, 'haproxy-config.%s' % args.domain)
+    haproxy_config_file = cpfs_nfs_common.get_haproxy_config_file_path(args.domain)
     match = IP_PATTERN.match(args.old_primary_server)
     if not match:
         fatal_error('Invalid old primary server: %s' % args.old_primary_server)

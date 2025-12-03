@@ -80,6 +80,7 @@ CPFS_PROXY_PORT_MAX = 60000
 
 CONFIG_FILE = '/etc/aliyun/cpfs/cpfs-utils.conf'
 CONFIG_SECTION = 'mount'
+WATCHDOG_CONFIG_SECTION = 'mount-watchdog'
 
 LOG_DIR = '/var/log/aliyun/cpfs'
 LOG_FILE = 'mount.log'
@@ -109,7 +110,8 @@ ALINAS_ONLY_OPTIONS = [
     # and there should be an external manager process responsible for starting watchdog.
     'no_start_watchdog',
     'alitimeo',
-    'hp_config_dir' # To specify ha proxy config path.
+    'hp_config_dir', # To specify ha proxy config path.
+    'unmount_grace_period_sec' # To specify unmount grace period for the exact mount point.
 ]
 
 UNSUPPORTED_OPTIONS = [
@@ -171,8 +173,8 @@ frontend cpfs2049
     default_backend bk2049
 
 backend bk2049
-    server cpfs_primary {remote}:60000 maxconn 2048 check ssl ca-file {cafile} verify required inter 2s fall 8 rise 30 on-marked-up shutdown-backup-sessions
-    server cpfs_backup  {backup}:60000 maxconn 2048 check ssl ca-file {cafile} verify required inter 2s fall 8 rise 30 backup
+    server cpfs_primary {remote}:2049 maxconn 2048 check ssl ca-file {cafile} verify required inter 2s fall 8 rise 30 on-marked-up shutdown-backup-sessions
+    server cpfs_backup  {backup}:2049 maxconn 2048 check ssl ca-file {cafile} verify required inter 2s fall 8 rise 30 backup
 """
 
 WATCHDOG_SERVICE = 'aliyun-cpfs-mount-watchdog'
@@ -478,7 +480,7 @@ def sign_state(state):
     return md5.hexdigest()
 
 
-def write_state_file(local_dns, ctx, tunnel_pid, command, config_file, files, state_file_dir):
+def write_state_file(local_dns, ctx, tunnel_pid, command, config_file, files, state_file_dir, unmount_grace_period_sec=None):
     """
     Return the name of the temporary file containing TLS tunnel state, prefixed with a '~'. This file needs to be
     renamed to a non-temporary version following a successful mount.
@@ -499,6 +501,8 @@ def write_state_file(local_dns, ctx, tunnel_pid, command, config_file, files, st
         'mountpoint': os.path.abspath(ctx.mountpoint),
         'timeo': get_ali_timeout(ctx.options)
     }
+    if (unmount_grace_period_sec is not None):
+        state['unmount_grace_period_sec'] = unmount_grace_period_sec
     state[STATE_SIGN] = sign_state(state)
 
     with open(os.path.join(state_file_dir, state_file), 'w') as f:
@@ -710,6 +714,7 @@ def start_tx(tx_name, ctx, state_file_dir=STATE_FILE_DIR):
         ctx.options['nas_ip'] = nas_ip
         ctx.options['backup_ip'] = backup_ip
         ctx.options['clientaddr'] = get_clientaddr(ctx.dns, nas_ip)
+        unmount_grace_period_sec_opt = ctx.options.get('unmount_grace_period_sec', None)
 
         tx = Tx(local_dns)
         yield tx
@@ -722,7 +727,8 @@ def start_tx(tx_name, ctx, state_file_dir=STATE_FILE_DIR):
                                               tx.cmd,
                                               tx.config_file,
                                               [tx.config_file],
-                                              state_file_dir)
+                                              state_file_dir,
+                                              unmount_grace_period_sec_opt)
         except:
             tx.process.kill()
             raise
@@ -849,17 +855,38 @@ def load_ha_proxy_path(options, apparmor_ha_profile, default_config_dir):
         hp_config_dir = default_config_dir
     return hp_config_dir
 
+# Prerequisite: Please make sure config_file_path exists
+def is_sslconfig(config_file_path):
+    with open(config_file_path, 'r') as f:
+        content = f.read()
+    
+    if 'ssl ca-file' in content:
+        return True
+    else:
+        return False
 
-def should_reuse_proxy(nas_dns, state_file_dir=STATE_FILE_DIR):
+def should_reuse_proxy(nas_dns, unmount_grace_period_sec_cfg, is_ssl=False, state_file_dir=STATE_FILE_DIR):
     try:
         state = cpfs_nfs_common.load_state_file(state_file_dir, nas_dns)
         if not state:
             return False
+        unmount_grace_period_sec = int(state.get('unmount_grace_period_sec', unmount_grace_period_sec_cfg))
         state_dns = state['nas_dns']
         ha_proxy_terminating = False
         if 'hp_terminating' in state:
-            logging.debug('Failed to reuse proxy because it is terminating.')
+            logging.info('Failed to reuse proxy for [%s] because it is terminating.', nas_dns)
             ha_proxy_terminating = True
+        if not os.path.exists(state['config_file']):
+            logging.info('Config path [%s] exists in state file, but not exist in file system.', state['config_file'])
+            return False
+        old_is_ssl = is_sslconfig(state['config_file'])
+        # Cannot reuse proxy and need to kill the running one since it's not been terminated.
+        if is_ssl != old_is_ssl and not ha_proxy_terminating:
+            if 'unmount_time' in state:
+                unmount_time = state['unmount_time']
+                fatal_error('Cannot mount with %s now, please wait %d seconds for the unmount to complete.' % ('tls' if is_ssl else 'non-tls', unmount_grace_period_sec - int(time.time() - unmount_time) + 1))
+            else:
+                fatal_error('Cannot mount with %s now, no unmount_time information is found, please check your mounting state.' % ('tls' if is_ssl else 'non-tls'))
         if nas_dns == state_dns and not ha_proxy_terminating:
             return True
         else:
@@ -1020,6 +1047,10 @@ def mount_nfs_reuse_proxy(ctx):
     if 'unmount_time' in state:
         state.pop('unmount_time')
         state['mountpoint'] = ctx.mountpoint
+        if 'unmount_grace_period_sec' in ctx.options:
+            state['unmount_grace_period_sec'] = ctx.options['unmount_grace_period_sec']
+        elif 'unmount_grace_period_sec' in state:
+            state.pop('unmount_grace_period_sec')
         cpfs_nfs_common.rewrite_state_file(state, STATE_FILE_DIR, ctx.dns)
         logging.info('rewrite state file:{}'.format(state))
 
@@ -1084,6 +1115,24 @@ def check_unsupported_options(options):
             logging.warning(warn_message)
             del options[unsupported_option]
 
+# 1230 Requirement: we don't allow customer to mount a single mountpoint with tls and non-tls at the same time
+# Please make sure the check is in the same lock with mount operation, otherwise the check may be invalid
+def check_unsupported_operations(dns_name, options):
+    state = cpfs_nfs_common.load_state_file(STATE_FILE_DIR, dns_name)
+    if not state: # no mount point with same dns name exists before, no need to check
+        return
+    if 'unmount_time' in state: # the old mount point is unmounted, no need to check
+        logging.info('Old mount point for [%s] is in unmounted state, no need to check', dns_name)
+        return
+    if 'config_file' not in state: 
+        logging.info('Config file for [%s] does not exist in state, no need to check.', dns_name)
+        return
+    elif os.path.exists(state['config_file']):
+        state['config_file'] = os.path.realpath(state['config_file'])
+        old_is_ssl = is_sslconfig(state['config_file'])
+        new_is_ssl = 'tls' in options
+        if old_is_ssl != new_is_ssl:
+            fatal_error('The mountpoint %s is already mounted with %s, mixing tls and non-tls is not supported in this version.' % (dns_name, 'tls' if old_is_ssl else 'non-tls'))
 
 def main():
     cpfs_nfs_common.check_env()
@@ -1101,10 +1150,17 @@ def main():
     check_network_status(fs_id, init_system, options)
 
     ctx = MountContext(config, init_system, dns_name, fs_id, path, mountpoint, options)
+    unmount_grace_period_sec = config.getint(WATCHDOG_CONFIG_SECTION, 'unmount_grace_period_sec',
+                                            default=30, minvalue=10, maxvalue=600)
 
     if 'tls' in options:
         if TLS_ENABLED:
-            mount_tls(ctx)
+            with cpfs_nfs_common.lock_file(dns_name) as _:
+                check_unsupported_operations(dns_name, options)
+                if should_reuse_proxy(dns_name, unmount_grace_period_sec, is_ssl=True):
+                    mount_nfs_reuse_proxy(ctx)
+                else:
+                    mount_tls(ctx)
         else:
             fatal_error('TLS is not supported in the current version, please contact Aliyun NAS Team')
     elif 'direct' in options:
@@ -1112,7 +1168,8 @@ def main():
 
     else:
         with cpfs_nfs_common.lock_file(dns_name) as _:
-            if should_reuse_proxy(dns_name):
+            check_unsupported_operations(dns_name, options)
+            if should_reuse_proxy(dns_name, unmount_grace_period_sec):
                 mount_nfs_reuse_proxy(ctx)
             else:
                 mount_nfs_proxy(ctx)

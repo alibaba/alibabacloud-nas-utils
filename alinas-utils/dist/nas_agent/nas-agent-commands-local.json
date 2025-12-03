@@ -172,14 +172,14 @@
         "efc_fuse_optional_flags": {
             "version": "0.0.1",
             "client_type": "efc",
-            "task": "find /sys/fs/ | grep connections/<connid>/writeback_opt | sort | head -1 | sudo xargs -I {} cat {}",
+            "task": "find /sys/fs/ | grep connections/<connid>/writeback_opt | sort | head -1 | xargs -I {} cat {}",
             "interval": 10,
             "description": "the optional flags enabled in fuse connection, currently only for writeback_opt"
         },
         "efc_fuse_inflight_count": {
             "version": "0.0.1",
             "client_type": "efc",
-            "task": "find /sys/fs/ | grep connections/<connid>/waiting | grep -v waiting_debug | sort | head -1 | sudo xargs -I {} cat {}",
+            "task": "find /sys/fs/ | grep connections/<connid>/waiting | grep -v waiting_debug | sort | head -1 | xargs -I {} cat {}",
             "interval": 10,
             "description": "the number of current inflight requests for fuse"
         },
