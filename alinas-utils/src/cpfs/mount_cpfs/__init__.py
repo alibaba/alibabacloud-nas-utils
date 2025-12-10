@@ -173,8 +173,8 @@ frontend cpfs2049
     default_backend bk2049
 
 backend bk2049
-    server cpfs_primary {remote}:2049 maxconn 2048 check ssl ca-file {cafile} verify required inter 2s fall 8 rise 30 on-marked-up shutdown-backup-sessions
-    server cpfs_backup  {backup}:2049 maxconn 2048 check ssl ca-file {cafile} verify required inter 2s fall 8 rise 30 backup
+    server cpfs_primary {remote}:60000 maxconn 2048 check ssl ca-file {cafile} verify required inter 2s fall 8 rise 30 on-marked-up shutdown-backup-sessions
+    server cpfs_backup  {backup}:60000 maxconn 2048 check ssl ca-file {cafile} verify required inter 2s fall 8 rise 30 backup
 """
 
 WATCHDOG_SERVICE = 'aliyun-cpfs-mount-watchdog'

@@ -16,3 +16,5 @@ artifacts:
     alinas-utils-aarch64-generic: build/aliyun-alinas-utils.*.generic.aarch64.rpm
     alinas-utils-aarch64-al8: build/aliyun-alinas-utils.*.al8.aarch64.rpm
     alinas-utils-aarch64-deb: build/aliyun-alinas-utils.*.aarch64.deb
+  packages:
+    - build/pkg/aliyun-alinas-utils-.*.tar

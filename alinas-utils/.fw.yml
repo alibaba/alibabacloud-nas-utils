@@ -19,3 +19,5 @@ artifacts:
     alinas-utils-el8: build/aliyun-alinas-utils.*.el8.x86_64.rpm
     alinas-utils-lp15: build/aliyun-alinas-utils.*.lp15.x86_64.rpm
     alinas-utils-deb: build/aliyun-alinas-utils.*.x86_64.deb
+  packages:
+    - build/aliyun-alinas-utils-.*.tar

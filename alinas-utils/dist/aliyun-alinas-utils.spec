@@ -58,12 +58,12 @@ mkdir -p %{buildroot}%{_sysconfdir}/aliyun/cpfs
 mkdir -p %{buildroot}%{_sysconfdir}/aliyun/alinas
 %if %{with_systemd}
 mkdir -p %{buildroot}%{_unitdir}
-install -p -m 644 %{_builddir}/%{name}/dist/cpfs/aliyun-cpfs-mount-watchdog.service %{buildroot}%{_unitdir}
-install -p -m 644 %{_builddir}/%{name}/dist/alinas/aliyun-alinas-mount-watchdog.service %{buildroot}%{_unitdir}
+install -p -m 644 %{_builddir}/%{name}/dist/cpfs/aliyun-cpfs-mount-watchdog.service %{buildroot}%{_unitdir}/aliyun-cpfs-mount-watchdog.service
+install -p -m 644 %{_builddir}/%{name}/dist/alinas/aliyun-alinas-mount-watchdog.service %{buildroot}%{_unitdir}/aliyun-alinas-mount-watchdog.service
 %else
 mkdir -p %{buildroot}%{_sysconfdir}/init
-install -p -m 644 %{_builddir}/%{name}/dist/cpfs/aliyun-cpfs-mount-watchdog.conf %{buildroot}%{_sysconfdir}/init
-install -p -m 644 %{_builddir}/%{name}/dist/alinas/aliyun-alinas-mount-watchdog.conf %{buildroot}%{_sysconfdir}/init
+install -p -m 644 %{_builddir}/%{name}/dist/cpfs/aliyun-cpfs-mount-watchdog.conf %{buildroot}%{_sysconfdir}/init/aliyun-cpfs-mount-watchdog.conf
+install -p -m 644 %{_builddir}/%{name}/dist/alinas/aliyun-alinas-mount-watchdog.conf %{buildroot}%{_sysconfdir}/init/aliyun-alinas-mount-watchdog.conf
 %endif
 
 mkdir -p %{buildroot}/sbin
@@ -76,16 +76,16 @@ mkdir -p %{buildroot}/opt/aliyun/cpfs/tools
 mkdir -p %{buildroot}/usr/local/nas-agent
 mkdir -p %{buildroot}/etc/nas-agent
 
-install -p -m 644 %{_builddir}/%{name}/dist/alinas/alinas-utils.conf %{buildroot}%{_sysconfdir}/aliyun/alinas
-install -p -m 444 %{_builddir}/%{name}/dist/alinas-utils.crt %{buildroot}%{_sysconfdir}/aliyun/alinas
+install -p -m 644 %{_builddir}/%{name}/dist/alinas/alinas-utils.conf %{buildroot}%{_sysconfdir}/aliyun/alinas/alinas-utils.conf
+install -p -m 444 %{_builddir}/%{name}/dist/alinas-utils.crt %{buildroot}%{_sysconfdir}/aliyun/alinas/alinas-utils.crt
 install -p -m 755 %{_builddir}/%{name}/src/alinas/mount_alinas/__init__.py %{buildroot}/sbin/mount.alinas
 install -p -m 755 %{_builddir}/%{name}/src/alinas/mount_alinas/umount.efc.sh %{buildroot}/sbin/umount.alifuse.aliyun-alinas-efc
 install -p -m 755 %{_builddir}/%{name}/src/alinas/mount_alinas/umount.efc.sh %{buildroot}/sbin/umount.alifuse.aliyun-alinas-eac
 install -p -m 755 %{_builddir}/%{name}/src/alinas/mount_alinas/umount.efc.sh %{buildroot}/sbin/umount.fuse.aliyun-alinas-efc
 install -p -m 755 %{_builddir}/%{name}/src/alinas/watchdog/__init__.py %{buildroot}/usr/bin/aliyun-alinas-mount-watchdog
 
-install -p -m 644 %{_builddir}/%{name}/dist/cpfs/cpfs-utils.conf %{buildroot}%{_sysconfdir}/aliyun/cpfs
-install -p -m 444 %{_builddir}/%{name}/dist/alinas-utils.crt %{buildroot}%{_sysconfdir}/aliyun/cpfs
+install -p -m 644 %{_builddir}/%{name}/dist/cpfs/cpfs-utils.conf %{buildroot}%{_sysconfdir}/aliyun/cpfs/cpfs-utils.conf
+install -p -m 444 %{_builddir}/%{name}/dist/alinas-utils.crt %{buildroot}%{_sysconfdir}/aliyun/cpfs/alinas-utils.crt
 install -p -m 755 %{_builddir}/%{name}/src/cpfs/mount_cpfs/__init__.py %{buildroot}/sbin/mount.cpfs-nfs
 install -p -m 755 %{_builddir}/%{name}/src/cpfs/watchdog/__init__.py %{buildroot}/usr/bin/aliyun-cpfs-mount-watchdog
 install -p -m 755 %{_builddir}/%{name}/src/cpfs/cpfs_nfs_common/__init__.py %{buildroot}/opt/aliyun/cpfs/cpfs_nfs_common.py
@@ -97,8 +97,8 @@ install -p -m 755 %{_builddir}/%{name}/src/alinas/nas_agent/nas-agent_%{arch} %{
 install -p -m 755 %{_builddir}/%{name}/src/alinas/nas_agent/ca-bundle.crt %{buildroot}/usr/local/nas-agent/ca-bundle.crt
 install -p -m 755 %{_builddir}/%{name}/src/alinas/nas_agent/identifier-generator %{buildroot}/usr/local/nas-agent/identifier-generator
 install -p -m 755 %{_builddir}/%{name}/src/alinas/nas_agent/aliyun-alinas-nfsiostat %{buildroot}/sbin/aliyun-alinas-nfsiostat
-install -p -m 644 %{_builddir}/%{name}/dist/nas_agent/nas-agent-commands-local.json %{buildroot}%{_sysconfdir}/aliyun/alinas
-install -p -m 644 %{_builddir}/%{name}/dist/alinas/aliyun-alinas-efc-minimum-supported-kernel-versions.json %{buildroot}%{_sysconfdir}/aliyun/alinas
+install -p -m 644 %{_builddir}/%{name}/dist/nas_agent/nas-agent-commands-local.json %{buildroot}%{_sysconfdir}/aliyun/alinas/nas-agent-commands-local.json
+install -p -m 644 %{_builddir}/%{name}/dist/alinas/aliyun-alinas-efc-minimum-supported-kernel-versions.json %{buildroot}%{_sysconfdir}/aliyun/alinas/aliyun-alinas-efc-minimum-supported-kernel-versions.json
 
 %files
 %defattr(-,root,root,-)

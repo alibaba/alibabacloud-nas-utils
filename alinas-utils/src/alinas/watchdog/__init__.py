@@ -91,6 +91,9 @@ UNAS_SHM_FILE_SIZE = 64
 UNAS_SHM_DADI_CAPACITY_FLAG = 'tier_DadiMemCacheCapacityMB'
 UNAS_SHM_DADI_CAPACITY_DEFAULT = 0
 
+CMDUTIL_BIN_NAME = 'aliyun-alinas-efc-cmd'
+CMDUTIL_BIN_PATH = '/usr/bin/%s' % CMDUTIL_BIN_NAME
+
 CGROUP_DIR = '/sys/fs/cgroup/memory/efc'
 OLD_CGROUP_DIR = '/sys/fs/cgroup/memory/eac'
 CGROUP_LIMIT_FILE = 'memory.limit_in_bytes'
@@ -548,6 +551,21 @@ def get_current_unas_mounts(mount_type, mount_file='/proc/mounts'):
 
     except Exception as e:
         fatal_error('Fail to get all mounts, exception msg:%s' % str(e))
+
+def get_dirs_with_prefix(dest, prefix):
+    dirs = {}
+    try:
+        if os.path.isdir(dest):
+            for sf in os.listdir(dest):
+                if not sf.startswith(prefix):
+                    continue
+                if not os.path.isdir(os.path.join(dest, sf)):
+                    continue
+                dirs[sf] = sf
+    except OSError as e:
+        if e.errno != errno.ENOENT:
+            logging.error('List dirs failed: msg=%s', str(e))
+    return dirs
 
 def get_files_with_prefix(state_file_dir, prefix='alinas'):
     """
@@ -1015,13 +1033,65 @@ def add_cgroup_limit(mount_cmd, mount_uuid, cgroup_dir=CGROUP_DIR):
     except Exception as e:
         logging.warning('add cgroup memory limit failed, uuid %s, %s, failure ignored' % (mount_uuid, str(e)))
 
+def check_backend_enable_lease(server, protocol, net_type):
+    cmd = '%s --cmdline_command=precheckconfig --cmdline_server=%s --cmdline_protocol=%s --cmdline_net_type=%s' % (CMDUTIL_BIN_PATH, server, protocol, net_type)
+    errcode, stdmsg, errmsg = exec_cmd_in_subprocess(cmd)
+    if errcode != 0 and 'lease_enabled' not in stdmsg:
+        logging.warning('precheckconfig fail, will fallback to lease_Enable=false, cmd:%s, errcode:%s, stdmsg:%s, errmsg:%s' % (cmd, errcode, stdmsg, errmsg))
+        return False
+    logging.info("precheck_fs_config cmd:%s, stdmsg:%s" % (cmd, stdmsg))
+    if 'lease_enabled:true' in stdmsg:
+        return True
+    else:
+        return False
+
+#https://project.aone.alibaba-inc.com/v2/project/958130/bug/72055927
+def adjust_mount_cmd_before_restart(mount_cmd, mount_path):
+    try:
+        # match fstype
+        match = re.search(r'fstype=([^, ]+)', mount_cmd)
+        if match:
+            fstype = match.group(1)
+        else:
+            raise Exception('fstype not found in mount cmd')
+        if fstype != 'cpfs':
+            raise Exception('fstype is not cpfs')
+        # match lease_Enable flag
+        match = re.search(r'--lease_Enable=([^, ]+)', mount_cmd)
+        if match:
+            lease = match.group(1)
+        else:
+            raise Exception('lease_Enable not found in mount cmd')
+        if lease != 'true':
+            raise Exception('lease_Enable is not true')
+        # match net
+        match = re.search(r'net=([^, ]+)', mount_cmd)
+        if match:
+            net_type = match.group(1)
+        else:
+            raise Exception('net not found in mount cmd')
+        # match protocol
+        match = re.search(r'protocol=([^, ]+)', mount_cmd)
+        if match:
+            protocol = match.group(1)
+        else:
+            raise Exception('protocol not found in mount cmd')
+        # preecheck
+        if not check_backend_enable_lease(mount_path, protocol, net_type):
+            mount_cmd = mount_cmd + " --watchdog_TurnOffLease=true "
+        else:
+            raise Exception("backend still support lease")
+    except Exception as e:
+        logging.info('remount use origin mount cmd, reason: %s', str(e))
+    return mount_cmd
+
 
 def restart_unas_process(unas_state, state_file_dir = STATE_FILE_DIR): 
     logging.debug("try restart eac, (mount_uuid:%s, mount_point:%s)" % (unas_state.mountuuid, unas_state.mountpoint))
 
     try:
         mount_uuid = unas_state.mountuuid
-        mount_cmd = unas_state.mountcmd 
+        mount_cmd = adjust_mount_cmd_before_restart(unas_state.mountcmd, unas_state.mountpath)
         mount_point = unas_state.mountpoint
         errcode, _, errmsg = exec_cmd_in_subprocess(mount_cmd)
 
@@ -1255,9 +1325,9 @@ def try_clean_up_logs(clean_path, log_dir_name, log_file_name):
 def schedule_clean_up_mount_files(log_file_dir=LOG_DIR, state_file_dir=STATE_FILE_DIR):
     # clean up log files when log time expired
     cur_time = int(time.time())
-    log_files = get_files_with_prefix(log_file_dir, "eac-")
-    log_files.update(get_files_with_prefix(log_file_dir, "efc-"))
-    for mount_name in log_files:
+    log_dirs = get_dirs_with_prefix(log_file_dir, "eac-")
+    log_dirs.update(get_dirs_with_prefix(log_file_dir, "efc-"))
+    for mount_name in log_dirs:
         try:
             state_file_name = mount_name.replace('efc', 'eac')
             state_file_path = os.path.join(state_file_dir, state_file_name)

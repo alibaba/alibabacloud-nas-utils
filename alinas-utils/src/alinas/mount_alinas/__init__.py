@@ -2594,13 +2594,20 @@ def check_and_mount_dev_shm():
     logging.warning('check_and_mount_dev_shm: run mount cmd success')
     return True
 
-def execute(cmd, timeout, output_when_error=False):
+def execute(cmd, timeout, output_when_error=False, force_timeout=False):
     p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True)
     timer = Timer(timeout, lambda process: process.kill(), [p])
 
     try:
         timer.start()
-        stdout, stderr = p.communicate()
+        if force_timeout:
+            try:
+                stdout, stderr = p.communicate(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                logging.error('Execute %s timeout' % cmd)
+                return -1
+        else:
+            stdout, stderr = p.communicate()
         stdout, stderr = stdout.decode('utf-8'), stderr.decode('utf-8')
         if p.returncode != 0:
             if output_when_error:
@@ -2729,7 +2736,7 @@ def do_bind_mount(ctx, bind_mountpoint, mount_point):
     mount_path = ctx.dns + ":" + ctx.path
     bindmount_src = bind_mountpoint + get_relative_path_to_bind_root(ctx)
     mount_cmd = 'mount --bind %s %s' % (bindmount_src, mount_point)
-    errcode = execute(mount_cmd, UNAS_MOUNT_TIMEOUT, True)
+    errcode = execute(mount_cmd, UNAS_MOUNT_TIMEOUT, True, force_timeout=True)
     if errcode == 0:
         logging.info('Successfully bind mounted %s at %s', bindmount_src, mount_point)
         print("Mount(bind) %s:%s successfully" % (UNAS_APP_NAME, mount_path))

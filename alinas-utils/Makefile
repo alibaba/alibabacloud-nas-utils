@@ -15,10 +15,10 @@ BUILD_DIR = build/rpmbuild
 export PYTHONPATH := $(shell pwd)/src
 
 .PHONY: all
-all: rpm deb
+all: rpm deb tar
 
 .PHONY: all-arm
-all-arm: rpm-arm deb
+all-arm: rpm-arm deb tar
 
 .PHONY: clean
 clean:
@@ -206,3 +206,7 @@ test:
 .PHONY: pack
 pack:
 	git archive HEAD -o alinas.tgz
+
+.PHONY: tar
+tar:
+	./tar.sh
