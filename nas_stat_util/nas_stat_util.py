@@ -14,7 +14,7 @@ from multiprocessing import Manager
 from queue import Queue
 from stat import S_ISREG, S_ISDIR
 
-TOOL_VERSION = "1.1"
+TOOL_VERSION = "1.2"
 INODE_LIST = 'inode_list'
 DIR_TREE = 'dir_tree'
 ALL = 'all'
@@ -41,6 +41,10 @@ class DirectoryStats:
                     self.ctime = _stat.st_ctime
                 if args.use_inode:
                     self.inode = int(_stat.st_ino)
+                if args.use_uid:
+                    self.uid = _stat.st_uid
+                if args.use_gid:
+                    self.gid = _stat.st_gid
             if args.use_all_inode_num:
                 self.all_inode_num = 0
             if args.use_all_size:
@@ -142,6 +146,10 @@ def format_output_line(args, item_path, _stat=None, dir_stat=None):
                         output_parts.append(output_timestamp(args, _stat.st_mtime, True))
                     elif field == 'ctime_ms':
                         output_parts.append(output_timestamp(args, _stat.st_ctime, True))
+                    elif field == 'uid':
+                        output_parts.append(_stat.st_uid)
+                    elif field == 'gid':
+                        output_parts.append(_stat.st_gid)
                 elif args.stat_type == DIR_TREE:
                     if field == 'path':
                         if args.output_without_prefix:
@@ -172,6 +180,10 @@ def format_output_line(args, item_path, _stat=None, dir_stat=None):
                         output_parts.append(output_timestamp(args, dir_stat.mtime, True))
                     elif field == 'ctime_ms':
                         output_parts.append(output_timestamp(args, dir_stat.ctime, True))
+                    elif field == 'uid':
+                        output_parts.append(dir_stat.uid)
+                    elif field == 'gid':
+                        output_parts.append(dir_stat.gid)
                     elif field == 'all_inode_num':
                         output_parts.append(dir_stat.all_inode_num)
                     elif field == 'all_size':
@@ -547,6 +559,8 @@ def check_and_init_args(args):
     args.use_mtime = "mtime" in args.output_format_list or "mtime_ms" in args.output_format_list
     args.use_ctime = "ctime" in args.output_format_list or "ctime_ms" in args.output_format_list
     args.use_inode = "inode" in args.output_format_list
+    args.use_uid = "uid" in args.output_format_list
+    args.use_gid = "gid" in args.output_format_list
     args.use_all_inode_num = "all_inode_num" in args.output_format_list
     args.use_all_size = "all_size" in args.output_format_list
     args.need_filter = (args.min_size is not None or args.max_size is not None
