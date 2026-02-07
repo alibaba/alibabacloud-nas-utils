@@ -2,6 +2,8 @@
 # python 3.11.12
 import argparse
 import concurrent
+import csv
+import io
 import os
 import stat
 import sys
@@ -14,7 +16,7 @@ from multiprocessing import Manager
 from queue import Queue
 from stat import S_ISREG, S_ISDIR
 
-TOOL_VERSION = "1.2"
+TOOL_VERSION = "1.3"
 INODE_LIST = 'inode_list'
 DIR_TREE = 'dir_tree'
 ALL = 'all'
@@ -115,6 +117,13 @@ def output_bytes(args, num_bytes):
     return num_bytes
 
 
+def to_csv_format(text):
+    output = io.StringIO()
+    writer = csv.writer(output, quoting=csv.QUOTE_MINIMAL, lineterminator='')
+    writer.writerow([text])
+    return output.getvalue()
+
+
 def format_output_line(args, item_path, _stat=None, dir_stat=None):
     try:
         output_parts = []
@@ -123,9 +132,14 @@ def format_output_line(args, item_path, _stat=None, dir_stat=None):
                 if args.stat_type == INODE_LIST:
                     if field == 'path':
                         if args.output_without_prefix:
-                            output_parts.append(item_path.replace(args.output_without_prefix, '', 1))
+                            raw_path = item_path.replace(args.output_without_prefix, '', 1)
                         else:
-                            output_parts.append(item_path)
+                            raw_path = item_path
+                        if args.use_csv_format:
+                            result_path = to_csv_format(raw_path)
+                        else:
+                            result_path = raw_path
+                        output_parts.append(result_path)
                     elif field == 'size':
                         output_parts.append(
                             output_bytes(args,
@@ -153,9 +167,14 @@ def format_output_line(args, item_path, _stat=None, dir_stat=None):
                 elif args.stat_type == DIR_TREE:
                     if field == 'path':
                         if args.output_without_prefix:
-                            output_parts.append(item_path.replace(args.output_without_prefix, '', 1))
+                            raw_path = item_path.replace(args.output_without_prefix, '', 1)
                         else:
-                            output_parts.append(item_path)
+                            raw_path = item_path
+                        if args.use_csv_format:
+                            result_path = to_csv_format(raw_path)
+                        else:
+                            result_path = raw_path
+                        output_parts.append(result_path)
                     elif field == 'inode_num':
                         output_parts.append(dir_stat.item_count)
                     elif field == 'size':
@@ -322,6 +341,8 @@ class CustomArgumentParser(argparse.ArgumentParser):
                                        help="output path without prefix")
         self.common_group.add_argument("--use-file-size", dest="use_file_size", action='store_true',
                                        help="output file size instead of disk usage")
+        self.common_group.add_argument("--use-csv-format", dest="use_csv_format", action='store_true',
+                                       help="use csv format for path")
         self.common_group.add_argument("--block-size", dest="block_size", type=int, default=512,
                                        help="file block size in storage, Usually 512 bytes")
         self.common_group.add_argument("-s", "--min-size", dest="min_size", type=int,
