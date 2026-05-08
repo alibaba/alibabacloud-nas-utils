@@ -10,7 +10,7 @@ ARCH=$(arch)
 VERSION=$(rpm -qi build/aliyun-alinas-utils*generic*rpm | egrep 'Version' | awk '{print $NF}')
 RELEASE=$(rpm -qi build/aliyun-alinas-utils*generic*rpm | egrep 'Release' | awk '{print $NF}')
 TAG=${VERSION}-${RELEASE}.${ARCH}
-TAR_CMD="tar cvf aliyun-alinas-utils-${TAG}.tar ${PATH_LIST} ${CHECKSUM_LIST}"
+TAR_CMD="tar cvf aliyun-alinas-utils-${TAG}.tar ${PATH_LIST} ${CHECKSUM_LIST} upgrade-tool"
 
 rm -rf $PKG_PATH
 mkdir -p $PKG_PATH
@@ -53,8 +53,18 @@ while IFS= read -r line; do
 	md5sum ${local_path} | awk '{print $1}' >> ${PKG_PATH}/${CHECKSUM_LIST}
 done < ${RPM_SPEC}
 
+cp dist/upgrade-tool $PKG_PATH
+echo meta/upgrade-tool >> ${PKG_PATH}/${PATH_LIST}
+echo meta/${PATH_LIST} >> ${PKG_PATH}/${PATH_LIST}
+echo meta/${CHECKSUM_LIST} >> ${PKG_PATH}/${PATH_LIST}
+
+md5sum dist/upgrade-tool | awk '{print $1}' >> ${PKG_PATH}/${CHECKSUM_LIST}
+md5sum ${PKG_PATH}/${PATH_LIST} | awk '{print $1}' >> ${PKG_PATH}/${CHECKSUM_LIST}
+md5sum ${PKG_PATH}/${CHECKSUM_LIST} | awk '{print $1}' >> ${PKG_PATH}/${CHECKSUM_LIST}
+
 cd $PKG_PATH
 echo $TAR_CMD
 bash -c "$TAR_CMD"
 
 popd
+

@@ -68,30 +68,6 @@ def get_version():
 def get_local_dns(mount):
     return mount.server.split(':')[0]
 
-def get_state_files(state_file_dir):
-    """
-    Return a dict of the absolute path of state files in state_file_dir, keyed by the mountpoint and port portion of
-    the filename.
-
-    Map: dns -> state_file_name
-    eg. cpfs-6e1854899b.cn-hangzhou.cpfs.aliyuncs.com  -> cpfs-6e1854899b.cn-hangzhou.cpfs.aliyuncs.com
-    """
-    state_files = {}
-
-    try:
-        if os.path.isdir(state_file_dir):
-            for sf in os.listdir(state_file_dir):
-                if not (sf.startswith('cpfs-') and sf.endswith('cpfs.aliyuncs.com')):
-                    continue
-
-                state_files[sf] = sf
-    except OSError as e:
-        if e.errno != errno.ENOENT:
-            logging.error('List state files failed: msg=%s', str(e))
-
-    return state_files
-
-
 def start_proxy(child_procs, state_file, command):
     # launch the tunnel in a process group so if it has any child processes, they can be killed easily
     logging.info('Starting proxy: "%s"', ' '.join(command))
@@ -99,7 +75,7 @@ def start_proxy(child_procs, state_file, command):
     # no need to specify env
     tunnel = subprocess.Popen(command, preexec_fn=os.setsid)
 
-    if not cpfs_nfs_common.is_pid_running(tunnel.pid):
+    if not cpfs_nfs_common.is_hp_running(tunnel.pid, state_file):
         raise RuntimeError('Failed to start proxy for {0}: command={1}'.format(state_file, command))
 
     logging.info('Started proxy, pid: %d', tunnel.pid)
@@ -113,7 +89,7 @@ def clean_up_mount_state(state_file_dir, state_file, pid, is_running):
     if is_running:
         cpfs_nfs_common.kill_proxy(pid)
 
-    if cpfs_nfs_common.is_pid_running(pid):
+    if cpfs_nfs_common.is_hp_running(pid, state_file):
         logging.info('Proxy: %d is still running, will retry termination', pid)
     else:
         logging.info('Proxy: %d is no longer running, cleaning up state', pid)
@@ -161,12 +137,11 @@ def restart_proxy(child_procs, state, state_file_dir, state_file):
 
         raise
 
-
 def check_alinas_mounts(watchdog, unmount_grace_period_sec_cfg, state_file_dir=STATE_FILE_DIR):
     nfs_mounts = cpfs_nfs_common.get_current_local_nfs_mounts()
     logging.debug('Current local NFS mounts: %s', list(nfs_mounts.values()))
 
-    state_files = get_state_files(state_file_dir)
+    state_files = cpfs_nfs_common.get_state_files(state_file_dir)
     logging.debug('Current state files in "%s": %s', state_file_dir, list(state_files.values()))
 
     for local_dns, state_file in state_files.items():
@@ -175,8 +150,8 @@ def check_alinas_mounts(watchdog, unmount_grace_period_sec_cfg, state_file_dir=S
                 state = watchdog.load_state_file(state_file_dir, state_file)
                 if not state:
                     continue
-
-                is_running = cpfs_nfs_common.is_pid_running(state['pid'])
+                
+                is_hp_running = cpfs_nfs_common.is_hp_running(state['pid'], state_file)
 
                 current_time = time.time()
                 if 'unmount_time' in state:
@@ -188,7 +163,7 @@ def check_alinas_mounts(watchdog, unmount_grace_period_sec_cfg, state_file_dir=S
                             logging.debug('Marking ha proxy for %s as terminated', state_file)
                             cpfs_nfs_common.rewrite_state_file(state, STATE_FILE_DIR, state_file)
                             logging.info('rewrite state file:{}'.format(state))
-                        clean_up_mount_state(state_file_dir, state_file, state['pid'], is_running)
+                        clean_up_mount_state(state_file_dir, state_file, state['pid'], is_hp_running)
 
                 elif local_dns not in nfs_mounts:
                     logging.info('recheck mount for "%s', state_file)
@@ -198,7 +173,7 @@ def check_alinas_mounts(watchdog, unmount_grace_period_sec_cfg, state_file_dir=S
                         cpfs_nfs_common.mark_as_unmounted(state, state_file_dir, state_file, current_time)
 
                 else:
-                    if is_running:
+                    if is_hp_running:
                         logging.debug('Proxy for %s is running', state_file)
                     else:
                         logging.warning('Proxy for %s is not running', state_file)
@@ -638,7 +613,7 @@ class DnsRefresher(object):
             try:
                 self._quit_signaled.wait(self._refresh_interval)
 
-                state_files = get_state_files(self._state_file_dir)
+                state_files = cpfs_nfs_common.get_state_files(self._state_file_dir)
 
                 for local_id in state_files:
                     self._check_dns(local_id)

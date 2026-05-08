@@ -55,7 +55,7 @@ def wait_for_haproxy_ready(local_dns, timeout=30):
         try: 
             pid_out = get_haproxy_pid(local_dns)
             pid = int(pid_out.decode('utf-8').split('\n')[0])
-            if cpfs_nfs_common.is_pid_running(pid):
+            if cpfs_nfs_common.is_hp_running(pid, local_dns):
                 return 
         except:
             time.sleep(sleep_time)
@@ -65,13 +65,19 @@ def wait_for_haproxy_ready(local_dns, timeout=30):
     fatal_error('Cannot start haproxy for {}'.format(local_dns))
 
 
-def update_alicpfs_server(local_dns, old_primary_server, old_backup_server, new_primary_server, new_backup_server):
+def update_alicpfs_server(local_dns, old_primary_server, old_backup_server, new_primary_server, new_backup_server, state_file_dir=STATE_FILE_DIR):
     nfs_mounts = cpfs_nfs_common.get_current_local_nfs_mounts()
     if local_dns in nfs_mounts:
         pid_out = get_haproxy_pid(local_dns)
         pid = int(pid_out.decode('utf-8').split('\n')[0])
-        if cpfs_nfs_common.is_pid_running(pid):
+        if cpfs_nfs_common.is_hp_running(pid, local_dns):
             cpfs_nfs_common.update_haproxy_config_file(local_dns, old_primary_server, old_backup_server, new_primary_server, new_backup_server)
+            # update state file here:
+            state_file_mgr = cpfs_nfs_common.StateFileManager()
+            state = state_file_mgr.load_state_file(state_file_dir, local_dns)
+            state["nas_ip"] = new_primary_server
+            state["backup_ip"] = new_backup_server
+            cpfs_nfs_common.rewrite_state_file(state, state_file_dir, local_dns)
             try:
                 cpfs_nfs_common.kill_proxy(pid)
                 wait_for_haproxy_ready(local_dns)

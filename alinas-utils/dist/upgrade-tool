@@ -1,0 +1,70 @@
+#!/usr/bin/env python3
+# -*- coding: UTF-8 -*-
+
+import os
+import sys
+import logging
+from logging.handlers import RotatingFileHandler
+import argparse
+import subprocess
+from collections import namedtuple
+import re
+
+LOG_FILEPATH = '/var/log/efc-ops-cli-upgrade.log'
+
+def bootstrap_logging():
+    max_bytes = 1048576
+    file_count = 2
+    handler = RotatingFileHandler(LOG_FILEPATH, maxBytes=max_bytes, backupCount=file_count)
+
+    handler.setFormatter(logging.Formatter(fmt='%(asctime)s - %(process)d - %(levelname)s - %(lineno)d - Package:Utils, %(message)s'))
+
+    logger = logging.getLogger()
+    logger.setLevel(logging.INFO)
+    logger.addHandler(handler)
+
+def fatal_error(message):
+    sys.stderr.write(f'{message}\n')
+    logging.error(message)
+    sys.exit(1)
+
+def parse_args():
+    if len(sys.argv) < 2 or sys.argv[1] not in ['prehook', 'posthook', 'watch']:
+        fatal_error(f'Usage: {sys.argv[0]} prehook/posthook/watch')
+    return sys.argv[1]
+
+def popen(cmd, wait=True, wait_timout=None):
+    """
+    A wapper of subprocess.Popen with cmd log
+    """
+    logging.info('Cmd: {0}'.format(cmd))
+    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, encoding='utf-8', shell=(type(cmd) is str), env=os.environ)
+    if not wait:
+        return p
+    else:
+        out, _ = p.communicate(timeout=wait_timout)
+        ret = p.returncode
+        logging.info('Cmd: {0}, Ret: {1}, Out: {2}'.format(cmd, ret, out.strip()))
+        return ret, out
+
+def run(run_type):
+    if run_type == 'prehook' or run_type == 'watch':
+        return
+
+    # restart watchdog
+    ret, pid = popen('pgrep -f aliyun-alinas-mount-watchdog')
+    if ret != 0:
+        fatal_error(f'failed to get aliyun-alinas-mount-watchdog processid')
+    ret, _ = popen(f'kill -9 {pid}')
+    logging.warning(f'restarted watchdog, pid:{pid}')
+
+
+def main():
+    bootstrap_logging()
+    run_type = parse_args()
+    logging.info(f'begin to run {run_type}')
+    run(run_type)
+    logging.info(f'end to run {run_type}')
+
+if '__main__' == __name__:
+    main()

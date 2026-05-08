@@ -78,6 +78,10 @@ def test_choose_proxy_addr_never_succeeds(mocker, capsys):
     out, err = capsys.readouterr()
     assert 'Failed to find a loopback ip' in err
 
+def mock_state_file(tmpdir, fsid, ip):
+    local_dns, _ = mount_alinas.gen_tls_local_dns_with_uuid(fsid, ip)
+    tmpdir.join(local_dns).write('xxx')
+    return local_dns
 
 def test_choose_proxy_addr_conflict(mocker, tmpdir):
     mocker.patch('socket.socket', return_value=MagicMock())
@@ -87,14 +91,14 @@ def test_choose_proxy_addr_conflict(mocker, tmpdir):
     assert ip == '127.0.1.1'
     assert port == 8888
 
-    tmpdir.join('xxx.127.0.1.1').write('xxx')
+    mock_state_file(tmpdir, 'fsid', '127.0.1.1')
     ip, port = mount_alinas.choose_proxy_addr(_get_config(), str(tmpdir))
 
     assert ip == '127.0.1.2'
     assert port == 8888
 
-    tmpdir.join('xxx.127.0.1.2').write('xxx')
-    tmpdir.join('xxx.127.0.1.3').write('xxx')
+    mock_state_file(tmpdir, 'fsid', '127.0.1.2')
+    mock_state_file(tmpdir, 'fsid', '127.0.1.3')
 
     ip, port = mount_alinas.choose_proxy_addr(_get_config(), str(tmpdir))
 

@@ -15,7 +15,6 @@ import os
 import json
 
 local_dns = 'alinas-abcde.127.0.0.1'
-local_ip = '127.0.0.1'
 tx = mount_alinas.Tx(local_dns)
 
 @contextmanager
@@ -39,13 +38,15 @@ def test_mount_proxy(mocker):
     assert tx.cmd == 'c'
 
 def _mock_mount_process(mocker, tmpdir):
-    mocker.patch('mount_alinas.choose_proxy_addr', return_value=(local_ip, '8888'))
+    mocker.patch('socket.socket')
     mocker.patch('mount_alinas.start_watchdog')
     mocker.patch('mount_alinas.subprocess_call')
     mocker.patch('mount_alinas.poll_proxy_process')
     mocker.patch('mount_alinas.setup_local_dns')
     mocker.patch('mount_alinas.wait_for_proxy_ready')
     mocker.patch('mount_alinas.get_version_specific_stunnel_options', return_value=(True, True))
+    mocker.patch('mount_alinas.check_and_create_private_key')
+    mocker.patch('mount_alinas.add_stunnel_ca_options')
 
     popen_mock = MagicMock()
     popen_mock.communicate.return_value = ('stdout', 'stderr', )
@@ -75,7 +76,7 @@ def test_uuid(mocker, tmpdir):
     ctx = mount_alinas.MountContext(config, 'init', 'dns', 'alinas-abcde', 'path', 'mp', None, {'tls':None})
     mount_alinas.mount_tls(ctx)
 
-    state_file = mount_alinas.tls_local_dns('alinas-abcde', local_ip, uuid)
+    state_file = mount_alinas.tls_local_dns('alinas-abcde', '127.0.1.1', uuid)
     abs_state_file = os.path.join(tmpdir, state_file)
     with open(abs_state_file) as f:
         state = json.load(f)
@@ -101,7 +102,6 @@ def test_uuid_for_concurrent_mounts(mocker, tmpdir):
 
     pnum = 20
     procs = []
-    uuids = Manager().list()
     for _ in range(pnum):
         p = Process(target=mount_alinas.mount_tls, args=(ctx,))
         procs.append(p)
@@ -120,6 +120,8 @@ def test_uuid_for_concurrent_mounts(mocker, tmpdir):
     assert len(state_files) == pnum
 
     uuids = []
+    local_dns_list = []
+    local_ips = []
     state_dirs = []
     stunnel_configs = []
     certificates = []
@@ -128,6 +130,8 @@ def test_uuid_for_concurrent_mounts(mocker, tmpdir):
         with open(abs_state_file) as f:
             state = json.load(f)
             uuid = state.get('uuid')
+            local_dns = state.get('local_dns')
+            local_ip = state.get('local_ip')
             state_dir = state.get('mountStateDir')
             stunnel_config = state.get('config_file')
             certificate = state.get('certificate')
@@ -136,11 +140,15 @@ def test_uuid_for_concurrent_mounts(mocker, tmpdir):
             assert os.path.exists(os.path.join(tmpdir, stunnel_config))
 
             uuids.append(uuid)
+            local_dns_list.append(local_dns)
+            local_ips.append(local_ip)
             state_dirs.append(state_dir)
             stunnel_configs.append(stunnel_config)
             certificates.append(certificate)
 
     assert len(set(uuids)) == pnum
+    assert len(set(local_dns_list)) == pnum
+    assert len(set(local_ips)) == pnum
     assert len(set(state_dirs)) == pnum
     assert len(set(stunnel_configs)) == pnum
     assert len(set(certificates)) == pnum

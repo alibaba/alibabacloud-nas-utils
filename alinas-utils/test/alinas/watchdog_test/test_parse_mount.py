@@ -114,3 +114,45 @@ def test_parse_dcpfs_mount():
     assert fstype == 'dcpfs'
     assert region == 'cn-hangzhou'
     assert path == '/'
+
+def test_parse_tls_ap_mount():
+    config = ConfigParser()
+    safe_config = watchdog.SafeConfig(config, None, None)
+    task = watchdog.UpdateMountEntitiesTask(safe_config, None, None)
+    tls_mount = watchdog.Mount._make([
+        "alinas-ap-111.123abc-xyz456.cn-hangzhou.tls.127.0.0.1-aBcD123:/",
+        "/mnt",
+        "nfs",
+        "rw",
+        "0",
+        "0"
+    ])
+    res = task._parse_mount(tls_mount)
+    assert res is not None
+    mount_uuid, fsid, fstype, region, path = res
+    assert mount_uuid == 'aBcD123'
+    assert fsid == 'ap-111.123abc'
+    assert fstype == 'tls'
+    assert region == 'cn-hangzhou'
+    assert path == '/'
+
+def test_parse_tls_non_ap_mount():
+    config = ConfigParser()
+    safe_config = watchdog.SafeConfig(config, None, None)
+    task = watchdog.UpdateMountEntitiesTask(safe_config, None, None)
+    tls_mount = watchdog.Mount._make([
+        "alinas-123abc-xyz456.cn-hangzhou.tls.127.0.0.1-aBcD123:/",
+        "/mnt",
+        "nfs",
+        "rw",
+        "0",
+        "0"
+    ])
+    res = task._parse_mount(tls_mount)
+    assert res is not None
+    mount_uuid, fsid, fstype, region, path = res
+    assert mount_uuid == 'aBcD123'
+    assert fsid == '123abc'
+    assert fstype == 'tls'
+    assert region == 'cn-hangzhou'
+    assert path == '/'

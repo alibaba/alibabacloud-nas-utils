@@ -1,4 +1,4 @@
-#! /usr/bin/env python
+#! /usr/bin/env python3
 # -*- python-mode -*-
 """ Show NFS iostat information by parsing /proc/self/mountstats
 """

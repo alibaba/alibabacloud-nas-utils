@@ -10,6 +10,7 @@
 #
 
 import base64
+import concurrent.futures
 import errno
 import fcntl
 import hashlib
@@ -182,15 +183,18 @@ NONFUSE_MOUNT_PATH = '/var/run/alinas/nonfuse_mounts'
 NONFUSE_MOUNT_LOCK = 'nonfuse_mounts.lock'
 UNAS_LOG_DIR = '/var/log/aliyun/alinas'
 UNAS_LOG_FILE_GC_IN_SEC = 2 * 24 * 3600 # default 2 days
+TOTAL_UNMOUNTED_LOG_MAX_SIZE = 1 * 1024 * 1024 * 1024  # 1 GB
 MONITOR_FILE_GC_IN_SEC = 3600 # default 1 hour
 EAC_SOCKET_SUFFIX = 'eac.sock'
 EFC_SOCKET_SUFFIX = 'efc.sock'
 EFC_LOCK_SUFFIX = 'efc.lock'
+EFC_PID_SUFFIX = 'efc.pid'
 
 UNAS_LOCK_STATEFILE_TIMEOUT = 20
 UNAS_MOUNT_FAIL_MAX_CHECK_TIME = 60
 UNAS_UMOUNT_FAIL_TIMEOUT = 180
 UNAS_UMOUNT_KILL_PROCESS_MIN_ALIVE = 60
+UNAS_ZOMBIE_PROCESS_TIMEOUT = 60
 BIND_ROOT_PREFIX = 'bindroot-'
 BIND_ROOT_DIR = STATE_FILE_DIR + '/bindroot'
 
@@ -199,6 +203,7 @@ FORCE_UMOUNT = 1
 UNAS_UMOUNT_MSG_NUM = 213
 BIND_TAG = 'bindtag'
 MOUNTPOINTS_ENV = 'MOUNT_POINTS'
+UNAS_PRECHECK_FS_FLAGS = ['unas_Accesspoint', 'unas_AKFile', 'unas_STSFile', 'unas_SignRegion']
 
 # nas-agent configuration
 LAST_MOUNTPOINT_FILE_PATH = '/etc/aliyun/alinas/last-mountpoint'
@@ -206,6 +211,10 @@ NAS_AGENT_LOCAL_COMMANDS_PATH = '/etc/aliyun/alinas/nas-agent-commands-local.jso
 NAS_AGENT_REMOTE_COMMANDS_DIR = '/etc/aliyun/alinas/nas-agent-commands-remote'
 NAS_AGENT_REMOTE_REPO_PATTERN = 'https://aliyun-alinas-nas-agent-remote-commands-%s.oss-%s-internal.aliyuncs.com'
 NAS_AGENT_REMOTE_COMMANDS_PATTERN = 'nas-agent-commands-%s.json'
+NAS_AGENT_REGION_ENV = 'NAS_AGENT_REGION'
+NAS_AGENT_SUPPORT_REGIONS = [
+    "cn-qingdao", "cn-beijing", "cn-zhangjiakou", "cn-huhehaote", "cn-wulanchabu", "cn-hangzhou", "cn-shanghai", "cn-shenzhen", "cn-heyuan", "cn-guangzhou", "cn-chengdu", "cn-hongkong", "cn-zhongwei", "ap-southeast-1", "ap-southeast-3", "ap-southeast-5", "ap-southeast-6", "ap-southeast-7", "ap-northeast-1", "ap-northeast-2", "us-west-1", "us-east-1", "eu-central-1", "eu-west-1", "me-east-1", "na-south-1",
+]
 
 NAS_AGENT_BIN_DIR = '/usr/local/nas-agent'
 NAS_AGENT_BIN_NAME = 'nas-agent'
@@ -228,15 +237,22 @@ UnasState = namedtuple('UnasState', ['mountuuid', 'mountpoint', 'mountpath', 'mo
 
 POD_UID_PATTERN = re.compile('^[0-9a-z]{8}-[0-9a-z]{4}-[0-9a-z]{4}-[0-9a-z]{4}-[0-9a-z]{12}$')
 NAS_AGENT_MOUNTPOINT_PATTERNS = {
-    'cpfs': re.compile(r'(?P<fsid>[0-9a-z]+-[0-9a-z]+)[-0-9a-z]+\.(?P<region>[-0-9a-z]+)\.cpfs\.aliyuncs\.com'),
+    'cpfs': re.compile(r'(?P<fsid>[0-9a-z]+-[0-9a-z]+)[-0-9a-z]+\.(?P<region>[-0-9a-z]+)\.cpfs\.\w+\.com'),
     'extreme': re.compile(r'(?P<fsid>[0-9a-z]+)[-0-9a-z]+\.(?P<region>[-0-9a-z]+)\.extreme\.nas\.aliyuncs\.com'),
     'hybrid': re.compile(r'(?P<fsid>[0-9a-z]+)[-0-9a-z]+\.(?P<region>[-0-9a-z]+)\.nas\.aliyuncs\.com'),
+    'tls': re.compile(r'alinas-(?P<fsid>[-0-9a-z]+(?:\.[-0-9a-z]+)?)-[-0-9a-z]+\.(?P<region>[-0-9a-z]+)\.tls\..*'),
     # do not support acceleration or no-region endpoint
     'oss': re.compile(r'(?P<fsid>[-0-9a-z]+)\.oss-(?P<region>[-0-9a-z]+?)(-internal)?\.aliyuncs\.com'),
     # oss accelerator endpoint, refer to https://help.aliyun.com/zh/oss/overview-77/#section-9t5-dsp-cze
     'oss-acc': re.compile(r'(?P<fsid>[-0-9a-z]+)\.(?P<region>[-0-9a-z]+?)-internal\.oss-data-acc\.aliyuncs\.com'),
 }
-NAS_AGENT_MOUNT_PATTERN = re.compile(r'^((?P<mount_uuid>[-0-9a-zA-Z]+):)?(?P<mountpoint>[^:]*):(?P<path>[^ ]+)')
+NAS_AGENT_MOUNT_PATTERNS = [
+    # tls: alinas-{fsid}-{suffix}.{region}.tls.{ip}-{uuid}:/path
+    re.compile(r'^(?P<mountpoint>alinas-[-0-9a-z.]+\.tls\.[0-9.]+-(?P<mount_uuid>[0-9a-zA-Z]+)):(?P<path>[^ ]+)'),
+    # other: [uuid:]mountpoint:/path
+    re.compile(r'^((?P<mount_uuid>[-0-9a-zA-Z]+):)?(?P<mountpoint>[^:]*):(?P<path>[^ ]+)'),
+]
+
 NAS_AGENT_OPID_PATTERN = re.compile('<opid>')
 NAS_AGENT_PID_PATTERN = re.compile('<pid>')
 NAS_AGENT_UUID_PATTERN = re.compile('<uuid>')
@@ -274,7 +290,9 @@ def binary_path_env():
     return env
 
 def exec_cmd_in_subprocess(cmd, **kwargs):
-    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True, env=binary_path_env(), **kwargs)
+    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, shell=True, executable='/bin/bash',
+                            env=binary_path_env(), **kwargs)
     stdmsg, errmsg = proc.communicate()
     stdmsg = stdmsg.decode(encoding='utf8')
     errmsg = errmsg.decode(encoding='utf8')
@@ -319,7 +337,7 @@ def unas_state_file_name(mount_uuid):
     return "eac-" + mount_uuid
 
 def execute_with_timeout(command, timeout, ignore_error=False):
-    proc = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True, env=binary_path_env())
+    proc = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True, executable='/bin/bash', env=binary_path_env())
     timer = threading.Timer(timeout, lambda process: process.kill(), [proc])
     try:
         timer.start()
@@ -336,6 +354,10 @@ def execute_with_timeout(command, timeout, ignore_error=False):
     finally:
         timer.cancel()
 
+def to_bool(val):
+    if not isinstance(val, str):
+        return False
+    return val.strip().lower() == "true"
 
 def download_file(url, path, timeout):
     command = 'wget "%s" -O "%s"' % (url, path)
@@ -428,6 +450,9 @@ def get_local_dns(mount):
 
 def is_alinas_mount(mount):
     return mount.server.startswith('alinas-') and 'nfs' in mount.type
+
+def is_nas_fstype(fstype):
+    return fstype == 'hybrid' or fstype == 'tls'
 
 MOUNT_TYPE_ALL='eac_efc'
 MOUNT_TYPE_EFC='aliyun-alinas-efc'
@@ -1020,7 +1045,7 @@ def add_cgroup_limit(mount_cmd, mount_uuid, cgroup_dir=CGROUP_DIR):
             f.write('0')
 
         # sort ps output by start time and reserve the latest one to avoid failure in upgrade
-        cmd = "ps -eww -o pid,start_time,cmd,args --sort=start_time | grep e[af]c | grep mount_uuid=%s | grep -vw grep | awk '{print $1}'" % mount_uuid
+        cmd = "ps -eww -o pid,start_time,cmd,args --sort=start_time | grep 'e[af]c' | grep mount_uuid=%s | grep -vw grep | awk '{print $1}'" % mount_uuid
         pids = os.popen(cmd).read()
         if pids.endswith('\n'):
             pids = pids[:-1]
@@ -1033,8 +1058,8 @@ def add_cgroup_limit(mount_cmd, mount_uuid, cgroup_dir=CGROUP_DIR):
     except Exception as e:
         logging.warning('add cgroup memory limit failed, uuid %s, %s, failure ignored' % (mount_uuid, str(e)))
 
-def check_backend_enable_lease(server, protocol, net_type):
-    cmd = '%s --cmdline_command=precheckconfig --cmdline_server=%s --cmdline_protocol=%s --cmdline_net_type=%s' % (CMDUTIL_BIN_PATH, server, protocol, net_type)
+def check_backend_enable_lease(server, protocol, net_type, flags):
+    cmd = '%s --cmdline_command=precheckconfig --cmdline_server=%s --cmdline_protocol=%s --cmdline_net_type=%s %s' % (CMDUTIL_BIN_PATH, server, protocol, net_type, flags)
     errcode, stdmsg, errmsg = exec_cmd_in_subprocess(cmd)
     if errcode != 0 and 'lease_enabled' not in stdmsg:
         logging.warning('precheckconfig fail, will fallback to lease_Enable=false, cmd:%s, errcode:%s, stdmsg:%s, errmsg:%s' % (cmd, errcode, stdmsg, errmsg))
@@ -1076,8 +1101,15 @@ def adjust_mount_cmd_before_restart(mount_cmd, mount_path):
             protocol = match.group(1)
         else:
             raise Exception('protocol not found in mount cmd')
-        # preecheck
-        if not check_backend_enable_lease(mount_path, protocol, net_type):
+        # match precheck flags
+        flag_list = []
+        for flag in UNAS_PRECHECK_FS_FLAGS:
+            match = re.search(r'%s=([^, ]+)' % flag, mount_cmd)
+            if match:
+                flag_list.append("--" + flag + "=" + match.group(1))
+        flags = ' '.join(flag_list)
+        # precheck
+        if not check_backend_enable_lease(mount_path, protocol, net_type, flags):
             mount_cmd = mount_cmd + " --watchdog_TurnOffLease=true "
         else:
             raise Exception("backend still support lease")
@@ -1085,6 +1117,69 @@ def adjust_mount_cmd_before_restart(mount_cmd, mount_path):
         logging.info('remount use origin mount cmd, reason: %s', str(e))
     return mount_cmd
 
+# 全局字典，记录僵尸进程首次检测到的时间
+zombie_detection_times = {}
+
+def try_remove_efc_lock_when_zombie(mount_uuid):
+    pid_file = f"{EFC_WORKSPACE_DIR}/{mount_uuid}.{EFC_PID_SUFFIX}"
+    lock_file = f"{EFC_WORKSPACE_DIR}/{mount_uuid}.{EFC_LOCK_SUFFIX}"
+    try:
+        if not os.path.exists(pid_file):
+            return
+        with open(pid_file) as f:
+            pid = int(f.read().strip())
+        
+        status_file = f"/proc/{pid}/status"
+        if not os.path.exists(status_file):
+            logging.warn(f"uuid:{mount_uuid} pid:{pid} status not exists")
+            return
+        
+        with open(status_file) as f:
+            status_lines = f.readlines()
+        
+        # 检查进程名称
+        name_matched = False
+        for line in status_lines:
+            if line.startswith("Name:"):
+                if "aliyun-alinas" in line:
+                    name_matched = True
+                break
+
+        # 检查是否僵尸状态
+        is_zombie = False
+        for line in status_lines:
+            if line.startswith("State:"):
+                # 状态格式: State: Z (zombie)
+                if "Z (zombie)" in line or "Z" in line:
+                    is_zombie = True
+                break
+        
+        # 如果不是僵尸状态或名称不匹配，清除记录并返回
+        if not is_zombie or not name_matched:
+            if pid in zombie_detection_times:
+                del zombie_detection_times[pid]
+                logging.warn(f"uuid:{mount_uuid} pid:{pid} name_matched:{name_matched} zombie:{is_zombie} is ok")
+            return
+        
+        # 记录僵尸检测时间
+        current_time = time.time()
+        if pid not in zombie_detection_times:
+            zombie_detection_times[pid] = current_time
+            logging.warn(f"uuid:{mount_uuid} pid:{pid} zombie:{is_zombie} first zombie")
+            return
+        
+        # 检查是否超时
+        zombie_duration = current_time - zombie_detection_times[pid]
+        if zombie_duration < UNAS_ZOMBIE_PROCESS_TIMEOUT:
+            logging.warn(f"uuid:{mount_uuid} pid:{pid} zombie time: {zombie_duration:.1f}s")
+            return
+        
+        logging.warn(f"uuid:{mount_uuid} pid:{pid} zombie time: {zombie_duration:.1f}s try remove lock")
+        del zombie_detection_times[pid]
+        os.remove(lock_file)
+
+    except Exception as e:
+        logging.error("try_remove_efc_lock_when_zombie error:{}".format(e), exc_info=True)
 
 def restart_unas_process(unas_state, state_file_dir = STATE_FILE_DIR): 
     logging.debug("try restart eac, (mount_uuid:%s, mount_point:%s)" % (unas_state.mountuuid, unas_state.mountpoint))
@@ -1141,7 +1236,7 @@ def check_unas_process_mem(unas_state):
     logging.debug("checking eac process mem_usage, (mount_uuid:%s, mount_point:%s)" % (unas_state.mountuuid, unas_state.mountpoint))
     try:
         mount_uuid = unas_state.mountuuid
-        pid = os.popen(PS_CMD + "| grep e[af]c | grep mount_uuid=%s |grep -vw grep | awk '{print $1}'" % mount_uuid).read().strip()
+        pid = os.popen(PS_CMD + "| grep 'e[af]c' | grep mount_uuid=%s |grep -vw grep | awk '{print $1}'" % mount_uuid).read().strip()
         if len(pid) == 0:
             logging.debug("checking eac process mem_usage not exist, (mount_uuid:%s, mount_point:%s)" % (unas_state.mountuuid, unas_state.mountpoint))
             return
@@ -1152,7 +1247,8 @@ def check_unas_process_mem(unas_state):
             mount_cmd = unas_state.mountcmd
             mount_options = re.split(' -o | --|=| |,', mount_cmd)
             is_uring = parse_val_from_kvstr(mount_options, "efc_EnableIOUring", "false") == "true"
-            memory_thres = CGROUP_BASE_MEMORY_LIMIT_SIZE + (URING_MEMORY_LIMIT_SIZE if is_uring else 0)
+            is_hybrid_uring = parse_val_from_kvstr(mount_options, "efc_UseHybridIOUring", "true") == "true"
+            memory_thres = CGROUP_BASE_MEMORY_LIMIT_SIZE + (URING_MEMORY_LIMIT_SIZE if is_uring and not is_hybrid_uring else 0)
             if resident - share > memory_thres:
                 logging.error("checking eac process mem_usage oom, (mount_uuid:%s, mount_point:%s), statm:%s" % (unas_state.mountuuid, unas_state.mountpoint, stm))
                 if read_config().getboolean(WATCHDOG_CONFIG_SECTION, 'oom_kill', default=True):
@@ -1322,6 +1418,91 @@ def try_clean_up_logs(clean_path, log_dir_name, log_file_name):
         logging.exception('try_clean_up_logs failed: msg=%s', str(e))
         return
 
+def _collect_all_unmounted_log_files(unmounted_dirs):
+    all_files = []
+    for log_dir in unmounted_dirs:
+        for root, _, filenames in os.walk(log_dir): # os.walk will process all files in unmounted_dirs recursively
+            for filename in filenames:
+                file_path = os.path.join(root, filename)
+                try:
+                    if not os.path.islink(file_path):
+                        stat = os.stat(file_path)
+                        all_files.append({
+                            'path': file_path,
+                            'size': stat.st_size,
+                            'mtime': stat.st_mtime
+                        })
+                except OSError:
+                    continue
+    return all_files
+
+def _cleanup_empty_dirs(unmounted_dirs):
+    for log_dir in unmounted_dirs:
+        try:
+            for root, dirs, _ in os.walk(log_dir, topdown=False):
+                for d_name in dirs:
+                    dir_path = os.path.join(root, d_name)
+                    try:
+                        if not os.listdir(dir_path):
+                            logging.info(f"Cleanup: Removing empty log directory: {dir_path}")
+                            os.rmdir(dir_path)
+                    except OSError:
+                        continue
+                
+                if not os.listdir(root):
+                    logging.info(f"Cleanup: Removing empty top-level log directory: {root}")
+                    os.rmdir(root)
+        except OSError:
+            continue
+
+def _cleanup_unmounted_logs_by_size(log_file_dir=LOG_DIR, state_file_dir=STATE_FILE_DIR):
+    try:
+        unmounted_log_dirs = []
+        all_log_dirs = get_dirs_with_prefix(log_file_dir, "eac-")
+        all_log_dirs.update(get_dirs_with_prefix(log_file_dir, "efc-"))
+
+        for mount_name in all_log_dirs:
+            state_file_name = mount_name.replace('efc', 'eac')
+            state_file_path = os.path.join(state_file_dir, state_file_name)
+            if not os.path.exists(state_file_path):
+                unmounted_log_dirs.append(os.path.join(log_file_dir, mount_name))
+        #unmounted_log_dirs: ['/var/log/alinas/efc-abcd123', '/var/log/alinas/efc-efz123']
+        if not unmounted_log_dirs:
+            return
+
+        all_files = _collect_all_unmounted_log_files(unmounted_log_dirs)
+
+        total_size = sum(f['size'] for f in all_files)
+
+        if total_size > TOTAL_UNMOUNTED_LOG_MAX_SIZE:
+            logging.warning(
+                "Total size of unmounted logs (%d bytes) exceeds limit (%d bytes). Starting cleanup by file age.",
+                total_size, TOTAL_UNMOUNTED_LOG_MAX_SIZE
+            )
+
+            all_files.sort(key=lambda x: x['mtime'])
+
+            for f in all_files:
+                if total_size <= TOTAL_UNMOUNTED_LOG_MAX_SIZE:
+                    break
+                
+                try:
+                    logging.debug(
+                        "Cleaning up oldest log file by size policy: %s (mtime: %d, size: %d)",
+                        f['path'], f['mtime'], f['size']
+                    )
+                    os.remove(f['path'])
+                    total_size -= f['size']
+                except OSError as e:
+                    logging.warning(f"Failed to remove {f['path']}: {e}")
+                    total_size -= f['size']
+
+            _cleanup_empty_dirs(unmounted_log_dirs)
+                            
+    except Exception as e:
+        logging.exception('Global log cleanup by size failed: msg=%s', str(e))
+
+
 def schedule_clean_up_mount_files(log_file_dir=LOG_DIR, state_file_dir=STATE_FILE_DIR):
     # clean up log files when log time expired
     cur_time = int(time.time())
@@ -1340,13 +1521,16 @@ def schedule_clean_up_mount_files(log_file_dir=LOG_DIR, state_file_dir=STATE_FIL
             try_clean_up_logs(mount_file_dir, 'vsclog', 'vsc.LOG')
             eac_log_dir = os.path.join(mount_file_dir, 'efclog' if is_new_name else 'eaclog')
             vsc_log_dir = os.path.join(mount_file_dir, 'vsclog')
-            # all log files cleaned, remove mount dir
-            if len(os.listdir(eac_log_dir)) == 0 and (not os.path.exists(vsc_log_dir) or len(os.listdir(vsc_log_dir)) == 0):
-                logging.warning("cleanup efc log dir:%s", mount_file_dir)
-                shutil.rmtree(mount_file_dir)
+            eac_dir_empty = not os.path.exists(eac_log_dir) or not os.listdir(eac_log_dir)
+            vsc_dir_empty = not os.path.exists(vsc_log_dir) or not os.listdir(vsc_log_dir)
+            if eac_dir_empty and vsc_dir_empty:
+                    logging.warning("cleanup efc log dir:%s", mount_file_dir)
+                    shutil.rmtree(mount_file_dir)
         except IOError as e:
             logging.exception('clean up eac mount files failed: msg=%s', str(e))
             continue
+    # clean up log files when all logs large than 1GB
+    _cleanup_unmounted_logs_by_size(log_file_dir, state_file_dir)
 
     for eac_file in os.listdir(EFC_WORKSPACE_DIR):
         try:
@@ -1380,7 +1564,7 @@ def schedule_clean_up_mount_files(log_file_dir=LOG_DIR, state_file_dir=STATE_FIL
 
 def is_dadi_enabled():
     try:
-        ps_cmd = "ps -eww -o args | grep aliyun-alinas-e[af]c"
+        ps_cmd = "ps -eww -o args | grep 'aliyun-alinas-e[af]c'"
         ps_info = os.popen(ps_cmd).read()
         for arg in re.findall('tier_EnableClusterCache=(\S+)', ps_info):
             if arg.lower() == 'true':
@@ -2071,13 +2255,19 @@ def check_nfs_mounts(config, watchdog, unmount_grace_period_sec, state_file_dir=
     state_files = get_files_with_prefix(state_file_dir, 'alinas-')
     logging.debug('Current state files in "%s": %s', state_file_dir, list(state_files.values()))
 
+    ps_cmd = PS_CMD + "| grep stunnel-"
+    ps_info = os.popen(ps_cmd).read()
+
     for local_dns, state_file in state_files.items():
         try:
             state = watchdog.load_state_file(state_file_dir, state_file)
             if not state:
                 continue
 
-            is_running = is_pid_running(state['pid'])
+            is_running = False
+            # For compatibility: old version may not have 'uuid' in state
+            if is_pid_running(state['pid']) and ('uuid' not in state or state['uuid'] in ps_info):
+                is_running = True
 
             current_time = time.time()
             if 'unmount_time' in state:
@@ -2251,7 +2441,7 @@ def get_process_alive_sec(pid):
     return alive
 
 def kill_process_uuid(mount_uuid, min_alive_sec=0):
-    ps_cmd = PS_CMD + "| grep e[af]c"
+    ps_cmd = PS_CMD + "| grep 'e[af]c'"
     ps_info = os.popen(ps_cmd).read()
     regex_mount = 'mount_uuid=%s' % mount_uuid 
     if regex_mount in ps_info:
@@ -2442,7 +2632,7 @@ def check_unas_mounts(watchdog, state_file_dir=STATE_FILE_DIR):
     try:
 
         # check unas mounts      
-        ps_cmd = PS_CMD + "| grep e[af]c"
+        ps_cmd = PS_CMD + "| grep 'e[af]c'"
         ps_info = os.popen(ps_cmd).read()
 
         for _, state_file in state_files.items():
@@ -2499,6 +2689,9 @@ def check_unas_mounts(watchdog, state_file_dir=STATE_FILE_DIR):
                             logging.info('Check eac status failed, mount_uuid:%s, no restart because efc lock not exist' % state['mountuuid'])
                         else:
                             # efc failover
+
+                            try_remove_efc_lock_when_zombie(mount_uuid)
+
                             logging.info('Check eac status failed, mount_uuid:%s, try restart' % state['mountuuid'])
                             restart_unas_process(unas_state)
                             
@@ -3074,6 +3267,9 @@ class Command(object):
         self._rules = content.get('rules', None)
         self._client_type = content.get('client_type', NAS_AGENT_CLIENT_TYPE_ALL)
         self._precondition = content.get('precondition', None)
+        self._ignore_error = content.get('ignore_error', None)
+        self._format = content.get('format', None)
+        self._key = content.get('key', None)
 
     @property
     def name(self):
@@ -3112,6 +3308,14 @@ class Command(object):
                 not NAS_AGENT_PATH_PATTERN.search(self._task) and
                 not NAS_AGENT_MOUNTPOINT_PATTERN.search(self._task))
     
+    @property
+    def format(self):
+        return self._format
+
+    @property
+    def key(self):
+        return self._key
+    
     def match_client_type(self, client_type):
         if self.client_type == NAS_AGENT_CLIENT_TYPE_ALL:
             return True
@@ -3122,7 +3326,7 @@ class Command(object):
     def tasks(self, mount_entities, args=None):
         if self.is_independent:
             regions = set(e.region for e in mount_entities)
-            return [("", "", regions, self._precondition, self._task)]
+            return [("", "", regions, self._precondition, self._task, self._ignore_error)]
         elif self.is_periodic:
             tasks = []
             for client_type, pid, uuid, connid, fsid, _, region, _, entries in mount_entities:
@@ -3138,7 +3342,7 @@ class Command(object):
                 precondition = self._precondition
                 if precondition:
                     precondition = re.sub(NAS_AGENT_UUID_PATTERN, uuid, precondition)
-                tasks.append((uuid, fsid, [region], precondition, task))
+                tasks.append((uuid, fsid, [region], precondition, task, self._ignore_error))
             return tasks
         elif self.event == self.EVENT_ADD_MOUNT or self.event == self.EVENT_DEL_MOUNT:
             path, mountpoint, (client_type, pid, uuid, connid, fsid, _, region, *_) = args
@@ -3153,7 +3357,7 @@ class Command(object):
             precondition = self._precondition
             if precondition:
                 precondition = re.sub(NAS_AGENT_UUID_PATTERN, uuid, precondition)
-            return [(uuid, fsid, [region], precondition, task)]
+            return [(uuid, fsid, [region], precondition, task, self._ignore_error)]
         else:
             opid, (client_type, pid, uuid, connid, fsid, _, region, *_) = args
             if not self.match_client_type(client_type):
@@ -3166,24 +3370,83 @@ class Command(object):
             precondition = self._precondition
             if precondition:
                 precondition = re.sub(NAS_AGENT_UUID_PATTERN, uuid, precondition)
-            return [(uuid, fsid, [region], precondition, task)]
+            return [(uuid, fsid, [region], precondition, task, self._ignore_error)]
+
+    def _parse_json_format(self, last_result, exe_time, output):
+        try:
+            output = json.loads(output)
+        except Exception as e:
+            logging.error('Cannot parse json output %s: %s', output, str(e))
+            return None
+
+        fields = {}
+        inner = output.get(self._key)
+        if inner is None:
+            return None
+        for rule in self._rules:
+            name, target, rtype = rule.get('name'), rule.get('target'), rule.get('type')
+            subkey = rule.get('subkey')
+            if target is None:
+                target = name
+
+            if subkey:
+                sub_obj = inner.get(subkey)
+                sub_inner = sub_obj if isinstance(sub_obj, dict) else inner
+            else:
+                sub_inner = inner
+
+            value = sub_inner.get(name)
+            if value is None:
+                continue
+
+            if rtype == 'raw':
+                fields[target] = value
+                continue
+
+            if last_result is None:
+                continue
+            last_exe_time, last_output = last_result
+            last_output = json.loads(last_output)
+            last_inner = last_output.get(self._key)
+
+            if subkey:
+                last_sub_obj = last_inner.get(subkey) if last_inner else None
+                last_sub_inner = last_sub_obj if isinstance(last_sub_obj, dict) else last_inner
+            else:
+                last_sub_inner = last_inner
+
+            duration = (exe_time - last_exe_time).total_seconds()
+
+            if rtype == 'complex':
+                expr = rule.get('expr')
+                if expr['type'] == 'div':
+                    divisor_diff = sub_inner[expr['divisor']] - last_sub_inner[expr['divisor']]
+                    if divisor_diff <= 0:
+                        continue
+                    fields[target] = (value - last_sub_inner[name]) / divisor_diff
+            elif rtype == 'compute':
+                fields[target] = (value - last_sub_inner[name]) / duration
+        return fields
 
     def _match_rules(self, last_result, result):
         exe_time, output = result
         if not output:
             return None
 
+        if self._format == 'json':
+            return self._parse_json_format(last_result, exe_time, output)
+
         rows = output.split('\n')
         units = [[row, *row.split()] for row in rows]
 
         fields = {}
         for rule in self._rules:
-            name, index, rtype = rule.get('name'), rule.get('index'), rule.get('type')
+            name, index, rtype, compute_type = rule.get('name'), rule.get('index'), rule.get('type'), rule.get("compute_type", None)
             if not name or index is None or not rtype:
                 logging.error('Cannot parse rule %s in command %s', str(rule), self.name)
                 return None
             if index < 0 or index >= len(units[0]):
-                logging.error('Index %d is illegal for output "%s"', index, output)
+                logging.warning('%s Index %d is illegal for output "%s"', self.name, index, output)
                 return None
 
             if rtype == 'compute':
@@ -3193,7 +3456,7 @@ class Command(object):
                 last_rows = last_output.split('\n')
                 last_units = [[last_row, *last_row.split()] for last_row in last_rows]
                 if len(last_units) != len(units) or len(last_units[0]) != len(units[0]):
-                    logging.error('Can not compute "%s" with "%s"', last_output, output)
+                    logging.error('%s Can not compute "%s" with "%s"', self.name, last_output, output)
                     return None
                 num = (float(units[0][index]) - float(last_units[0][index]))
                 den = 0
@@ -3207,6 +3470,11 @@ class Command(object):
                     fields[name] = num / den
             elif rtype == 'raw':
                 fields[name] = units[0][index]
+            elif rtype == 'raw-nonzero':
+                if float(units[0][index]) <= 0.0:
+                    continue
+                else:
+                    fields[name] = units[0][index]
             elif rtype == 'json':
                 try:
                     state = json.loads(units[0][index])
@@ -3214,6 +3482,39 @@ class Command(object):
                     logging.error('Unable to parse json from result of task %s "%s"', self.name, self._task)
                     return None
                 fields.update(state)
+            # 仅支持平铺的json结构
+            elif rtype == 'json-compute':
+                present_result = json.loads(units[0][index])
+                if last_result is None:
+                    continue
+                last_exe_time, last_output_str = last_result
+                try:
+                    last_output = json.loads(last_output_str)
+                except (ValueError, TypeError):
+                    logging.error('Failed to parse last JSON output for json-compute in task %s', self.name)
+                    continue
+                for key, curr_val in present_result.items():
+                    try:
+                        curr_num = float(curr_val)
+                    except (TypeError, ValueError):
+                        continue
+                    # 获取上次的值，若不存在则默认为 0.0
+                    last_val = last_output.get(key, 0.0)
+                    try:
+                        last_num = float(last_val)
+                    except (TypeError, ValueError):
+                        last_num = 0.0
+                    if compute_type == "diff_time_avg":
+                        diff = float(curr_num) - float(last_num)
+                        den = (exe_time - last_exe_time).total_seconds()
+                        compute_result = diff / den
+                    else:
+                        # 默认是diff，或者None，计算差值
+                        compute_result = float(curr_num) - float(last_num)
+                    if compute_result < 0:
+                        # 计数器回绕，跳过该字段
+                        continue
+                    fields[key] = compute_result
             else:
                 logging.error('Unknown rule type %s in task %s', rtype, self.name)
         return fields
@@ -3275,12 +3576,15 @@ class CommandTask(object):
             else:
                 tasks = command.tasks(mount_entities, self._command_args)
             results = {}
-            for uuid, fsid, regions, precondition, task in tasks:
+            for uuid, fsid, regions, precondition, task, _ignore_error in tasks:
                 if precondition:
                     rc, exe_time, output = self._execute(precondition, ignore_error=True)
                     if rc != 0:
                         continue
-                rc, exe_time, output = self._execute(task)
+                ignore_error = False
+                if _ignore_error and to_bool(_ignore_error):
+                    ignore_error = True
+                rc, exe_time, output = self._execute(task, ignore_error=ignore_error)
                 if not output:
                     continue
                 if self._command_args is None or not command.is_periodic:
@@ -3312,6 +3616,7 @@ class CommandTask(object):
 class NasAgentConfigTask(object):
     def __init__(self, config, env_monitor):
         self._fsid = None
+        self._fstype = None
         self._region = None
         self._config = config
         self._env_monitor = env_monitor
@@ -3338,13 +3643,13 @@ class NasAgentConfigTask(object):
                 mountpoint = f.read()
                 fsid, fstype, region = parse_mountpoint(mountpoint)
                 if fsid is not None:
-                    mounts.append((fsid, fstype, region))
+                    mounts.append((False, fsid, fstype, region))
         except Exception as e:
             if e.errno != errno.ENOENT:
                 logging.error('Failed to read last mountpoint, error %s', str(e))
         return mounts
 
-    def _get_possible_mounts_from_mountints_env(self):
+    def _get_possible_mounts_from_mountpoints_env(self):
         mounts = []
         try:
             if not os.environ.get(MOUNTPOINTS_ENV):
@@ -3353,7 +3658,7 @@ class NasAgentConfigTask(object):
             for mp in j["mountPoints"]:
                 fsid, fstype, region = parse_mountpoint(mp["mountPointID"].strip())
                 if fsid is not None:
-                    mounts.append((fsid, fstype, region))
+                    mounts.append((True, fsid, fstype, region))
         except Exception as e:
             logging.error('Failed to _get_region_and_fsid from env, %s' % str(e))
         return mounts
@@ -3361,7 +3666,8 @@ class NasAgentConfigTask(object):
     def _get_possible_mounts(self):
         mounts = []
         mounts.extend(self._get_possible_mounts_from_last_mountpoint())
-        mounts.extend(self._get_possible_mounts_from_mountints_env())
+        logging.info(f'mounts from last mountpoint: {mounts}')
+        mounts.extend(self._get_possible_mounts_from_mountpoints_env())
         return mounts
 
     def _config_server(self, server_name):
@@ -3381,8 +3687,14 @@ class NasAgentConfigTask(object):
         finally:
             sock.close()
 
+    def _check_region(self, region, verbose):
+        reachable = self._check_network(self._endpoint(self._server_name(region)))
+        if verbose and not reachable:
+            logging.warning(f'endpoint of {region} is unreachable')
+        return reachable
+
     def _nas_agent_config(self, server_name):
-        return {
+        config =  {
             'config_server_address': self._config_server(server_name),
             'data_server_list': [{
                 'cluster': server_name,
@@ -3401,6 +3713,10 @@ class NasAgentConfigTask(object):
             "streamlog_formats": [],
             "streamlog_tcp_port": 11111,
         }
+        working_hostname = os.environ.get('SLS_WORKING_HOSTNAME')
+        if working_hostname is not None:
+            config['working_hostname'] = working_hostname
+        return config
 
     def _region_in_config(self):
         try:
@@ -3412,18 +3728,60 @@ class NasAgentConfigTask(object):
             logging.error('Fail to read nas agent config, error %s', str(e))
         return None
 
+    def _check_all_regions(self):
+        logging.warning(f'will check all regions')
+        regions_cnt = len(NAS_AGENT_SUPPORT_REGIONS)
+        reachable_indices = []
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            futures_map = {executor.submit(self._check_region, NAS_AGENT_SUPPORT_REGIONS[i], False) : i for i in range(regions_cnt)}
+            for future in concurrent.futures.as_completed(futures_map):
+                idx = futures_map[future]
+                region = NAS_AGENT_SUPPORT_REGIONS[idx]
+                try:
+                    reachable = future.result()
+                    if reachable:
+                        reachable_indices.append(idx)
+                        logging.info(f'found reachable endpoint by region "{region}"')
+                except Exception as e:
+                    logging.error(f'got exception {e} when check {region}')
+        if reachable_indices:
+            return NAS_AGENT_SUPPORT_REGIONS[min(reachable_indices)]
+        logging.warning(f'checks for all regions failed')
+        return None
+
+    def _update_from_mounts(self, mounts):
+        env_region = os.environ.get(NAS_AGENT_REGION_ENV)
+        if env_region and self._check_region(env_region, verbose=True):
+            self._region = env_region
+            return
+        for trusted, fsid, fstype, region in mounts:
+            if self._check_region(region, verbose=True):
+                self._fsid = fsid
+                self._region = region
+                return
+        if not env_region and all(not trusted for trusted, *_ in mounts):
+            return
+        # there are some trusted mounts, but their regions are unreachable, check all regions if permitted
+        if self._config.getboolean(NAS_AGENT_CONFIG_SECTION, 'check_all_regions', default=False):
+            region = self._check_all_regions()
+            if region:
+                self._region = region
+
     def run(self):
         if os.path.exists(NAS_AGENT_CONF_PATH):
             self._region = self._region_in_config()
+            logging.info(f'config with region {self._region} already exists')
             return
 
         mount_entities = self._env_monitor.get_mount_entities()
-        mounts = [(e.fsid, e.fstype, e.region) for e in mount_entities]
+        mounts = [(True, e.fsid, e.fstype, e.region) for e in mount_entities]
         if not mounts:
             # there is no mount currently, get region and fsid from file and env
             mounts.extend(self._get_possible_mounts())
-        for fsid, fstype, region in mounts:
-            server = self._server_name(region)
+        self._update_from_mounts(mounts)
+        if self._region:
+            logging.info(f'got region {self._region}')
+            server = self._server_name(self._region)
             endpoint = self._endpoint(server)
             if self._check_network(endpoint):
                 try:
@@ -3433,8 +3791,6 @@ class NasAgentConfigTask(object):
                     with open(temppath, 'w') as f:
                         json.dump(self._nas_agent_config(server), f)
                     os.rename(temppath, NAS_AGENT_CONF_PATH)
-                    self._fsid = fsid
-                    self._region = region
                     return
                 except Exception as e:
                     logging.error('Fail to write nas agent config, error %s', str(e))
@@ -3442,7 +3798,7 @@ class NasAgentConfigTask(object):
     def done(self, result):
         try:
             if self._region:
-                self._env_monitor.update_temporary_mount(self._fsid, self._region)
+                self._env_monitor.update_temporary_mount(self._fsid, self._region, self._fstype)
                 return
 
             task = NasAgentConfigTask(self._config, self._env_monitor)
@@ -3600,7 +3956,11 @@ class UpdateMountEntitiesTask(object):
         return self.STATE_NORMAL, fuse_requests
 
     def _parse_mount(self, mount):
-        match = NAS_AGENT_MOUNT_PATTERN.match(mount.server)
+        match = None
+        for pattern in NAS_AGENT_MOUNT_PATTERNS:
+            match = pattern.match(mount.server)
+            if match:
+                break
         if match is None:
             return None
         mount_uuid, mountpoint, path = map(match.group, ['mount_uuid', 'mountpoint', 'path'])
@@ -3641,10 +4001,11 @@ class UpdateMountEntitiesTask(object):
             if res is None:
                 logging.warning('Fail to match server %s', mount.server)
                 continue
-            _, fsid, fstype, region, path = res
+            mount_uuid, fsid, fstype, region, path = res
             conn_id = get_connection_id(None, mount.mountpoint)
             client_type = NAS_AGENT_CLIENT_TYPE_NFS_V4 if 'nfs4' in mount.type else NAS_AGENT_CLIENT_TYPE_NFS_V3
-            mount_uuid = '%s-%s' % (client_type, conn_id)
+            if mount_uuid is None:
+                mount_uuid = '%s-%s' % (client_type, conn_id)
             # same device entries are grouped
             if mount_uuid in mount_entities:
                 mount_entities[mount_uuid].entries.append((path, mount.mountpoint))
@@ -3674,6 +4035,7 @@ class EnvMonitor(object):
         self._mount_entities = []
         self._hostname = socket.gethostname()
         self._hostaddr = socket.gethostbyname(self._hostname)
+        self._default_id = None
 
         self._upload_mount_info_interval = config.getint(
             NAS_AGENT_CONFIG_SECTION, 'upload_mount_info_interval', default=10, minvalue=5, maxvalue=300)
@@ -3694,6 +4056,13 @@ class EnvMonitor(object):
     @property
     def default_region(self):
         return self._default_region
+
+    @property
+    def default_id(self):
+        if self._default_id is None:
+            hash_bucket = int(hashlib.md5(self.hostname.encode('utf-8')).hexdigest(), 16) % 100
+            self._default_id = 'any-nas-mount-' + str(hash_bucket)
+        return self._default_id
 
     @staticmethod
     def parse_command_file(command_file):
@@ -3727,10 +4096,10 @@ class EnvMonitor(object):
                 task = CommandTask(epoch, self, command.name, args)
                 self.push_task(0, task)
 
-    def update_temporary_mount(self, fsid, region):
+    def update_temporary_mount(self, fsid, region, fstype):
         self._default_region = region
         if fsid and not self._mount_entities:
-            self._update_user_defined_ids([fsid])
+            self._update_user_defined_ids([fsid], is_nas_fstype(fstype))
 
     def update_commands(self, remote_files):
         remote_confs = []
@@ -3795,8 +4164,10 @@ class EnvMonitor(object):
             return udid == stdout
         return False
 
-    def _update_user_defined_ids(self, fsids):
+    def _update_user_defined_ids(self, fsids, has_nas_mount):
         ids = set()
+        if has_nas_mount:
+            ids.add(self.default_id)
         for fsid in fsids:
             _, rc, stdout, _ = execute_with_timeout('%s %s' % (NAS_AGENT_ID_GEN_BIN_PATH, fsid), 1)
             if stdout is None:
@@ -3813,9 +4184,16 @@ class EnvMonitor(object):
                             continue
                         ids.add(line)
                 os.truncate(NAS_AGENT_ID_FILE_PATH, 0)
+            has_default_id = False
             with open(NAS_AGENT_ID_FILE_PATH, 'w') as f:
                 for id in ids:
+                    if id == self.default_id:
+                        has_default_id = True
+                        continue
                     f.write('%s\n' % id)
+                # write default_id at the end to give it lowest priority
+                if has_default_id:
+                    f.write('%s\n' % self.default_id)
         except IOError as e:
             logging.error('Fail to update nas agent ids, error: %s', str(e))
 
@@ -3886,13 +4264,16 @@ class EnvMonitor(object):
             self._trigger(*event)
 
         fsids = []
+        has_nas_mount = False
         for mount in mount_entities:
-            if mount.fstype == 'oss':
+            if is_nas_fstype(mount.fstype):
+                has_nas_mount = True
+            if mount.fstype == 'oss' or mount.fstype == 'tls':
                 fsids.append(mount.fsid)
             else:
                 fsids.append(mount.fsid.split('-')[-1])
 
-        self._update_user_defined_ids(fsids)
+        self._update_user_defined_ids(fsids, has_nas_mount)
 
     def get_mount_entities(self):
         self._lock.acquire()
@@ -4052,6 +4433,7 @@ def update_loop_time():
 def check_loop_time():
     global MAIN_LOOP_TIME
     while True:
+        logging.info(f'heartbeat, last main loop time: {MAIN_LOOP_TIME}')
         now = time.time()
         if MAIN_LOOP_TIME > 0 and now > MAIN_LOOP_TIME + MAIN_LOOP_HANG_ABORT_THRES:
             logging.error(f'main loop has been hang from {MAIN_LOOP_TIME}, abort')
@@ -4074,7 +4456,10 @@ def main():
     poll_interval_sec = config.getint(WATCHDOG_CONFIG_SECTION, 'poll_interval_sec', default=3, minvalue=1, maxvalue=60)
     unmount_grace_period_sec = config.getint(WATCHDOG_CONFIG_SECTION, 'unmount_grace_period_sec',
                                              default=30, minvalue=10, maxvalue=600)
-
+    global TOTAL_UNMOUNTED_LOG_MAX_SIZE
+    # min 100M, max 10G
+    TOTAL_UNMOUNTED_LOG_MAX_SIZE = config.getint(WATCHDOG_CONFIG_SECTION,'total_unmounted_log_max_size',default=TOTAL_UNMOUNTED_LOG_MAX_SIZE,
+        minvalue=100 * 1024 * 1024, maxvalue=10 * 1024 * 1024 * 1024)
     adjust_memory_limit()
 
     create_workspace()

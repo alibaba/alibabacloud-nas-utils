@@ -202,7 +202,6 @@ ALIFUSE_FILE_NAME = 'efc-alifuse'
 ALIFUSE_MODULE_PATH = '/usr/bin/%s.ko' % ALIFUSE_FILE_NAME
 ALIFUSE_CTL_MOUNT_PATH = '/sys/fs/alifuse/connections'
 FUSE_CTL_MOUNT_PATH = '/sys/fs/fuse/connections'
-ALIFUSE_DEV_NAME = '/dev/alifuse'
 FUSE_DEV_NAME = '/dev/fuse'
 FUSE_DEV_IOC_RECOVER = 3230197193 # ioctl请求标签号
 FUSE_DEV_IOC_RECOVER_SIZE = 136 # ioctl请求参数的size
@@ -247,6 +246,7 @@ UNAS_UMOUNT_MSG_NUM = 213
 UNAS_UMOUNT_BUSY_SLEEP = 0.5
 UNAS_UMOUNT_BUSY_MAX_SLEEP = 5
 BIND_TAG = 'bindtag'
+UNAS_PRECHECK_FS_FLAGS = ['unas_Accesspoint', 'unas_AKFile', 'unas_STSFile', 'unas_SignRegion']
 
 FS_ID_PATTERN = re.compile('^(?P<fs_id>[-0-9a-z.]+)(?::(?P<path>/.*))?$')
 MP_URL_PATTERN = re.compile('^(?P<url>[-0-9a-z.]+)(?::(?P<path>/.*))?$')
@@ -325,7 +325,7 @@ CENTOS8_RELEASE_NAME = 'CentOS Linux release 8'
 ALICLOUD_LINUX3_RELEASE_NAME = 'Alibaba Cloud Linux release 3 (Soaring Falcon)'
 ALICLOUD_LINUX3_LIFSEA_RELEASE_NAME = 'Alibaba Cloud Linux Lifsea (ContainerOS) release 3'
 SKIP_NO_LIBWRAP_RELEASES = [RHEL8_RELEASE_NAME, CENTOS8_RELEASE_NAME, ALICLOUD_LINUX3_RELEASE_NAME, ALICLOUD_LINUX3_LIFSEA_RELEASE_NAME]
-SKIP_NO_LIBWRAP_RELEASE_IDS = {'alinux' : '3'}
+SKIP_NO_LIBWRAP_RELEASE_IDS = {'alinux' : '3', 'alinux': '4'}
 
 PS_CMD = 'ps -eww -o pid,cmd,args '
 #    PID CMD                         COMMAND
@@ -335,6 +335,8 @@ PS_CMD = 'ps -eww -o pid,cmd,args '
 
 MountContext = namedtuple('MountContext', ('config', 'init_system', 'dns', 'fs_id', 'path', 'mountpoint', 'credentials', 'options'))
 
+# Global timing dictionary for mount delay statistics
+stat_timestamps = {}
 
 def fatal_error(user_message, log_message=None, exit_code=1):
     if log_message is None:
@@ -356,7 +358,7 @@ def get_version():
         else:
             cmd = "yum list installed aliyun-alinas-utils | grep aliyun-alinas | awk '{ print $2 }'"
         proc = subprocess.Popen(cmd,
-                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True)
+                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True, executable='/bin/bash')
         stdout, _ = proc.communicate()
         stdout = stdout.decode().strip()
 
@@ -392,8 +394,8 @@ def validate_options(options):
 def ip_is_used(ip, state_file_dir):
     if not os.path.isdir(state_file_dir):
         return False
-
-    return any([sf.endswith(ip) for sf in os.listdir(state_file_dir)])
+    # For compatibility
+    return any([(ip + '-' in sf or sf.endswith(ip)) for sf in os.listdir(state_file_dir)])
 
 
 def choose_proxy_addr(config, state_file_dir=STATE_FILE_DIR):
@@ -837,6 +839,24 @@ def setup_local_dns(dns, ip, options, hostfile='/etc/hosts'):
             logging.warning('atomic rename hosts from /tmp not work, %s', str(e))
             atomic_write_hostfile(options, lines, hostfile, tmpdir=os.path.dirname(hostfile))
 
+def execute_with_timeout(command, timeout, ignore_error=False):
+    proc = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True, env=binary_path_env())
+    timer = threading.Timer(timeout, lambda process: process.kill(), [proc])
+    try:
+        timer.start()
+        stdout, stderr = proc.communicate()
+        exe_time = datetime.now()
+        stdout, stderr = stdout.decode('utf-8'), stderr.decode('utf-8')
+        if proc.returncode != 0 and not ignore_error:
+            logging.error('Fail to execute %s, rc %d', command, proc.returncode)
+        return exe_time, proc.returncode, stdout, stderr
+    except Exception as e:
+        if not ignore_error:
+            logging.error('Fail to execute "%s", error %s', command, str(e))
+        return None, None, None, None
+    finally:
+        timer.cancel()
+
 def wait_for_proxy_ready(local_dns, proxy_ip, proxy_port, timeout=60):
     deadline = time.time() + timeout
 
@@ -852,15 +872,13 @@ def wait_for_proxy_ready(local_dns, proxy_ip, proxy_port, timeout=60):
 
 
 def is_proxy_ready(ip, port):
-    sk = socket.socket()
-    try:
-        sk.connect((ip, port))
-        return True
-    except:
+    # example : LISTEN  0  4096  127.0.1.1%lo:12049  0.0.0.0:*  users:(("stunnel",pid=2311460,fd=9))
+    _, rc, stdout, _ = execute_with_timeout('ss -lntp | grep stunnel', 5)
+    if rc != 0 or stdout is None:
         return False
-    finally:
-        sk.close()
-
+    # match ip:port with optional interface suffix (e.g., 127.0.1.1%lo:12049 or 127.0.1.1:12049)
+    pattern = r'%s(?:%%\w+)?:%s\s' % (re.escape(ip), port)
+    return re.search(pattern, stdout) is not None
 
 def get_clientaddr(dns, ip):
     sk = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -904,6 +922,43 @@ def unlock_file(fd):
         except IOError as e:
             raise
 
+def init_mount_stats():
+    stat_timestamps.clear()
+    record_mount_stat('total_start_time')
+
+def record_mount_stat(key):
+    stat_timestamps[key] = time.time()
+
+def complete_mount_stats(ctx):
+    """Calculate and log mount delay statistics (milliseconds)."""
+    total_start_time = stat_timestamps.get('total_start_time', 0)
+    stunnel_start_time = stat_timestamps.get('stunnel_start_time', 0)
+    proxy_ready_time = stat_timestamps.get('proxy_ready_time', 0)
+    nfs_mount_end_time = stat_timestamps.get('nfs_mount_end_time', 0)
+    if not nfs_mount_end_time:
+        return
+    
+    preparation_delay = (stunnel_start_time - total_start_time) * 1000
+    stunnel_startup_delay = (proxy_ready_time - stunnel_start_time) * 1000
+    nfs_mount_delay = (nfs_mount_end_time - proxy_ready_time) * 1000
+    total_delay = (nfs_mount_end_time - total_start_time) * 1000
+    
+    logging.info('mount_latency_statistics:\t'
+                 'protocol: tls\t'
+                 'remote_mnt: %s\t'
+                 'local_dir: %s\t'
+                 'preparation_latency: %.3f\t'
+                 'stunnel_startup_latency: %.3f\t'
+                 'nfs_mount_latency: %.3f\t'
+                 'total_latency: %.3f',
+                 ctx.dns,
+                 ctx.mountpoint,
+                 preparation_delay,
+                 stunnel_startup_delay,
+                 nfs_mount_delay,
+                 total_delay)
+
+    stat_timestamps.clear()
 
 @contextmanager
 def lock_alinas(state_file_dir=STATE_FILE_DIR, lock_type=ALINAS_LOCK, timeout=0):
@@ -994,7 +1049,9 @@ def start_tx(tx_name, ctx, state_file_dir=STATE_FILE_DIR):
                 with lock_dns(state_file_dir):
                     setup_local_dns(local_dns, host, ctx.options)
                 wait_for_proxy_ready(local_dns, host, port)
+                record_mount_stat('proxy_ready_time')
                 mount_nfs_directly(local_dns, ctx.path, ctx.mountpoint, ctx.options)
+                record_mount_stat('nfs_mount_end_time')
             except:
                 tx.process.kill()
                 raise
@@ -1589,6 +1646,7 @@ def bootstrap_tls(config, fs_id, mountpoint, local_dns, dns_name, security_crede
     # launch the tunnel in a process group so if it has any child processes, they can be killed easily
     # by the mount watchdog
     logging.info('Starting TLS tunnel: "%s"', ' '.join(tunnel_args))
+    record_mount_stat('stunnel_start_time')
     tunnel_proc = subprocess.Popen(tunnel_args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, preexec_fn=os.setsid)
     logging.info('Started TLS tunnel, pid: %d', tunnel_proc.pid)
 
@@ -1708,9 +1766,11 @@ def mount_tls(ctx):
                  ctx.mountpoint,
                  ctx.options)
 
+    init_mount_stats()
     with start_tx('Stunnel', ctx) as tx:
         config_file, process, cmd, cert_details = bootstrap_tls(ctx.config, ctx.fs_id, ctx.mountpoint, tx.local_dns, ctx.dns, ctx.credentials, ctx.options)
         tx.commit(config_file, process, cmd, cert_details)
+    complete_mount_stats(ctx)
 
 
 def write_unas_state_file(state, state_file_dir, state_file):
@@ -1769,7 +1829,9 @@ def binary_path_env():
     return env
 
 def exec_cmd_in_subprocess(cmd, **kwargs):
-    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True, env=binary_path_env(), **kwargs)
+    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, shell=True, executable='/bin/bash',
+                            env=binary_path_env(), **kwargs)
     stdmsg, errmsg = proc.communicate()
     stdmsg = stdmsg.decode(encoding='utf8')
     errmsg = errmsg.decode(encoding='utf8')
@@ -2090,6 +2152,11 @@ def mount_fuse():
         errcode, stdmsg, errmsg = exec_cmd_in_subprocess(modprobe_cmd)
         if errcode != 0:
             logging.warning('Fuse module modprobe failed, errmsg:%s' % errmsg)
+        # try modprobe fs-fuse(alias of kmod-fuse2) in ubuntu
+        modprobe_cmd = "modprobe fs-fuse"
+        errcode, stdmsg, errmsg = exec_cmd_in_subprocess(modprobe_cmd)
+        if errcode != 0:
+            logging.warning('Fuse(fs-fuse) module modprobe failed, errmsg:%s' % errmsg)
 
     except Exception as e:
         logging.warning('Fail to mount fuse, exception msg:%s' % str(e))
@@ -2111,12 +2178,11 @@ def create_workspace():
         if e.errno != errno.EEXIST and e.errno != errno.ENOENT:
             fatal_error('Fail to create workspace, exception msg:%s' % str(e))
 
-def fuse_kernel_has_recovery():
+
+def check_fuse_dev_has_recovery(dev_name):
     support = False
-
-    # try open ALIFUSE_DEV_NAME
-    if os.path.exists(ALIFUSE_DEV_NAME):
-        fd = os.open(ALIFUSE_DEV_NAME, os.O_RDWR | os.O_CLOEXEC)
+    if os.path.exists(dev_name):
+        fd = os.open(dev_name, os.O_RDWR | os.O_CLOEXEC)
         if fd > 0:
             try:
                 fcntl.ioctl(fd, FUSE_DEV_IOC_RECOVER, bytearray(FUSE_DEV_IOC_RECOVER_SIZE))
@@ -2125,29 +2191,12 @@ def fuse_kernel_has_recovery():
                     support = True
             finally:
                 os.close(fd)
-
-            if support:
-                logging.info('alifuse kernel support failover')
-                return support
-
-    # try open FUSE_DEV_NAME
-    if os.path.exists(FUSE_DEV_NAME):
-        fd = os.open(FUSE_DEV_NAME, os.O_RDWR | os.O_CLOEXEC)
-        if fd > 0:
-            try:
-                fcntl.ioctl(fd, FUSE_DEV_IOC_RECOVER, bytearray(FUSE_DEV_IOC_RECOVER_SIZE))
-            except OSError as e:
-                if e.errno == errno.EINVAL:
-                    support = True
-            finally:
-                os.close(fd)
-
-            if support:
-                logging.info('fuse kernel support failover')
-                return support
-
-    logging.info('fuse kernel not support failover')
+    logging.info(f'fuse kernel support failover:{support}, dev:{dev_name}')
     return support
+
+def fuse_kernel_has_recovery(ctx):
+    dev_name = FUSE_DEV_NAME if 'fuse_dev' not in ctx.options else ctx.options['fuse_dev']
+    return check_fuse_dev_has_recovery(dev_name)
 
 def check_sessmgr_required(ctx, mount_uuid, mount_upgrade):
     sessmgr_required = False
@@ -2155,7 +2204,7 @@ def check_sessmgr_required(ctx, mount_uuid, mount_upgrade):
     # first mount, check mount options and kernel recovery capacity
     if not mount_upgrade:
         if 'fd_store' not in ctx.options:
-            if fuse_kernel_has_recovery():
+            if fuse_kernel_has_recovery(ctx):
                 ctx.options['fd_store'] = 'kernel'
             else:
                 ctx.options['fd_store'] = 'sessmgrd'
@@ -2193,6 +2242,13 @@ def prepare_mount_unas(config):
     if alifuse_ret == 1 and fuse_ret == 1:
         fatal_error("alifusectl or fusectl should exist one!")
 
+def check_fuse_protocol():
+    errcode, stdmsg, errmsg = exec_cmd_in_subprocess('ls /sys/fs/fuse/connections/*/stats')
+    if errcode != 0:
+        logging.error('mount to original fuse temporarily, but will fail soon')
+        return False
+    return True
+
 def wait_mount_completed(mount_uuid, mount_path, timeout=3):
     deadline = time.time() + timeout
     local_mount_dns = mount_uuid + ':' + mount_path
@@ -2201,7 +2257,7 @@ def wait_mount_completed(mount_uuid, mount_path, timeout=3):
         while time.time() < deadline:
             unas_mounts = get_current_unas_mounts(MOUNT_TYPE_EFC)
             for m in unas_mounts:
-                if m.server == local_mount_dns:
+                if m.server == local_mount_dns and check_fuse_protocol():
                     return True
 
             if not check_unas_process(mount_uuid) and \
@@ -2241,7 +2297,7 @@ def mount_fuse_ctl(mount_type, mount_path, mount_file='/proc/mounts'):
             return 0
 
     except Exception as e:
-        logging.waring('Fail to mount %s, exception msg:%s' % (mount_type, str(e)))
+        logging.warning('Fail to mount %s, exception msg:%s' % (mount_type, str(e)))
         return 1
 
 def serialize_unas_options(options, mount_uuid):
@@ -2269,26 +2325,14 @@ def serialize_unas_options(options, mount_uuid):
     return ','.join(unas_options), ' '.join(unas_flags)
 
 def precheck_unas_flag(fs_type, mount_path, options):
-    if 'flagcheck' in options and options['flagcheck'] == 'none':
+    if options.get('flagcheck') == 'none':
         logging.info('Not flag check')
         return
     if fs_type == 'cpfs':
-        config_map = {}
-        precheck_fs_config(mount_path, options, config_map)
-        efc_need_lease = True
-        backend_support_lease = False
-        if 'g_lease_Enable' in options:
-            if options['g_lease_Enable'] == 'false':
-                efc_need_lease = False
-            logging.info('efc mount sepcify g_lease_Enable: %s', options['g_lease_Enable'])
-        if 'lease_enabled' in config_map and not config_map['lease_enabled']:
-            backend_support_lease = False
-        elif 'lease_enabled' in config_map and config_map['lease_enabled']:
-            backend_support_lease = True
-        if efc_need_lease and backend_support_lease:
-            options['g_lease_Enable'] = 'true'
-        else:
-            options['g_lease_Enable'] = 'false'
+        if options.get('g_lease_Enable') == 'false':
+            return
+        backend_config_map = precheck_fs_config(mount_path, options)
+        options['g_lease_Enable'] = 'true' if backend_config_map.get('lease_enabled') else 'false'
 
 def gen_unas_mount_cmd(uuid, mount_point, mount_path, options, log_path, vsc_log_path):
     mount_cmd = UNAS_BIN_PATH
@@ -2595,7 +2639,7 @@ def check_and_mount_dev_shm():
     return True
 
 def execute(cmd, timeout, output_when_error=False, force_timeout=False):
-    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True)
+    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True, executable='/bin/bash')
     timer = Timer(timeout, lambda process: process.kill(), [p])
 
     try:
@@ -2636,20 +2680,27 @@ def get_uuid_lock_name(mount_uuid):
     else:
         return UNAS_MOUNT_LOCK_PREFIX + mount_uuid + '.lock'
 
-def precheck_fs_config(mount_path, options, config_map):
+def get_precheck_fs_flags(options):
+    flags = []
+    for k, v in options.items():
+        if k.startswith('g_') and k[2:] in UNAS_PRECHECK_FS_FLAGS:
+            flags.append('--%s=%s' % (k[2:], str(v)))
+    return ' '.join(flags)
+
+def precheck_fs_config(mount_path, options):
     if not os.path.exists(CMDUTIL_BIN_PATH):
         fatal_error('fail to find cmdutil binary')
+    config_map = {}
     protocol = options.get('protocol')
     net_type = options.get('net')
-    cmd = '%s --cmdline_command=precheckconfig --cmdline_server=%s --cmdline_protocol=%s --cmdline_net_type=%s' % (CMDUTIL_BIN_PATH, mount_path, protocol, net_type)
+    precheck_flags = get_precheck_fs_flags(options)
+    cmd = '%s --cmdline_command=precheckconfig --cmdline_server=%s --cmdline_protocol=%s --cmdline_net_type=%s %s' % (CMDUTIL_BIN_PATH, mount_path, protocol, net_type, precheck_flags)
     errcode, stdmsg, errmsg = exec_cmd_in_subprocess(cmd)
     if errcode != 0 and 'lease_enabled' not in stdmsg:
         fatal_error('Failed to get precheckconfig, cmd:%s, errcode:%s, stdmsg:%s, errmsg:%s' % (cmd, errcode, stdmsg, errmsg))
     logging.info("precheck_fs_config cmd:%s, stdmsg:%s" % (cmd, stdmsg))
-    if 'lease_enabled:false' in stdmsg:
-        config_map.update({'lease_enabled': False})
-    elif 'lease_enabled:true' in stdmsg:
-        config_map.update({'lease_enabled': True})
+    config_map['lease_enabled'] = 'lease_enabled:true' in stdmsg
+    return config_map
 
 def get_mount_err_log(uuid):
     try:
@@ -2923,7 +2974,7 @@ def mount_unas(ctx):
             else:
                 fatal_error("kernel not support efc, mount failed")
 
-        if auto_fallback_nfs and not fuse_kernel_has_recovery():
+        if auto_fallback_nfs and not fuse_kernel_has_recovery(ctx):
             logging.warning('kernel not support fuse recovery, fallback to nfs mount with default options')
             return mount_nfs_directly(ctx.dns, ctx.path, ctx.mountpoint, {})
 
@@ -2944,26 +2995,10 @@ def mount_unas(ctx):
                 mount_options['trybind'] = 'no'
 
         if 'accesspoint' in mount_options:
-            mount_options['no_kernel_permission'] = 'true'
             mount_options['g_unas_Accesspoint'] = mount_options["accesspoint"]
-            mount_options['g_unas_DoConnectHandShake'] = 'true'
-
-        if 'no_kernel_permission' in mount_options:
-            mount_options['g_unas_EnableUserSpacePermissionCheck'] = 'true'
-
-        if 'ram' in mount_options:
-            akid = ctx.credentials["AccessKeyId"]
-            aksecret = ctx.credentials["AccessKeySecret"]
-            token = ctx.credentials.get('SecurityToken', None)
-            mount_options['g_unas_AkId'] = akid
-            if token:
-                mount_options['g_unas_SecurityToken'] = token
-
             region = get_target_region(ctx.config, ctx.fs_id)
-            current_time = get_utc_now()
-            date = current_time.strftime(SIGV4_DATETIME_FORMAT)
-            mount_options['g_unas_Signature'] = calculate_signature(date, current_time, aksecret, region)
-            mount_options['g_unas_SigningDate'] = date
+            if region:
+                mount_options['g_unas_SignRegion'] = region
 
         mount_point = ctx.mountpoint
         mount_path = ctx.dns + ":" + ctx.path
@@ -3352,6 +3387,7 @@ def parse_arguments(args=None):
             if not mp_url.endswith('.nas.aliyuncs.com'):
                 fatal_error('Invalid mountpoint url: only aliyun NAS is supported')
         else:
+            fs_id = 'alinas-' + '.'.join(match.group('fs_id').split('.')[:2])
             path = match.group('path') or '/'
             # TODO: check for efc_vsc_cpfs
     else:
@@ -3525,8 +3561,8 @@ def main():
     if path and ' ' in path or mountpoint and ' ' in mountpoint:
         fatal_error('Do not support space in path now')
 
-    logging.info('Mount request: version=%s options=%s dns_name=%s, fs_id=%s, path=%s, mountpoint=%s', 
-                get_version(), options, dns_name, fs_id, path, mountpoint)
+    logging.info('Mount request: options=%s dns_name=%s, fs_id=%s, path=%s, mountpoint=%s',
+                options, dns_name, fs_id, path, mountpoint)
     check_unsupported_options(options)
 
     init_system = get_init_system()

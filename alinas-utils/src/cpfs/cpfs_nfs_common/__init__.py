@@ -88,6 +88,12 @@ def fatal_error(user_message, log_message=None, exit_code=1, exception=None):
         raise exception.__class__(user_message)
     sys.exit(exit_code)
 
+def warning_info(user_message, log_message=None):
+    if log_message is None:
+        log_message = user_message
+    
+    sys.stdout.write('%s\n%s' % (user_message, DEFAULT_LOG_MSG))
+    logging.warning(log_message)
 
 STATE_FILE_DIR = '/var/run/cpfs'
 STATE_SIGN = 'sign'
@@ -200,6 +206,35 @@ def cpfs_dns_contains_ip(dns, ip):
     ips, _ = _resolve_cpfs_dns(dns)
     return ip in ips
 
+def get_process_cmd(pid):
+    """
+    根据pid获取进程完整的启动命令及所有参数
+    """
+    cmdline_path = '/proc/{}/cmdline'.format(pid)
+    
+    if not os.path.exists(cmdline_path):
+        logging.warning('error pid: {} does not exist in /proc/{}/cmdline or you do not have permission to access it.'.format(pid, pid))
+        return None
+
+    try:
+        with open(cmdline_path, 'rb') as f:
+            content = f.read()
+            
+            if not content:
+                logging.warning('pid: {} is a kernel thread or a zombie process.'.format(pid))
+                return None
+            
+            command_string = content.replace(b'\x00', b' ').decode('utf-8', errors='replace')
+            
+            return command_string.strip()
+            
+    except PermissionError as e:
+        logging.error('error: permission denied, cannot read PID {} information. PermissionError info: {}'.format(pid, e))
+        return None
+    except Exception as e:
+        logging.error('error: cannot read PID {} information. Exception info: {}'.format(pid, e))
+        return None
+    
 
 def is_pid_running(pid):
     try:
@@ -207,6 +242,15 @@ def is_pid_running(pid):
         return True
     except OSError:
         return False
+
+
+def is_hp_running(pid, suffix):
+    pid_running = is_pid_running(pid)
+    if pid_running:
+        process_cmd = get_process_cmd(pid)
+        if process_cmd and process_cmd.startswith('haproxy') and process_cmd.endswith(suffix):
+            return True
+    return False
 
 
 def kill_proxy(pid):
@@ -506,6 +550,28 @@ class SafeConfig(object):
         except:
             return default
 
+def get_state_files(state_file_dir):
+    """
+    Return a dict of the absolute path of state files in state_file_dir, keyed by the mountpoint and port portion of
+    the filename.
+
+    Map: dns -> state_file_name
+    eg. cpfs-6e1854899b.cn-hangzhou.cpfs.aliyuncs.com  -> cpfs-6e1854899b.cn-hangzhou.cpfs.aliyuncs.com
+    """
+    state_files = {}
+
+    try:
+        if os.path.isdir(state_file_dir):
+            for sf in os.listdir(state_file_dir):
+                if not (sf.startswith('cpfs-') and sf.endswith('cpfs.aliyuncs.com')):
+                    continue
+
+                state_files[sf] = sf
+    except OSError as e:
+        if e.errno != errno.ENOENT:
+            logging.error('List state files failed: msg=%s', str(e))
+
+    return state_files
 
 # If the file not exists, no side effects
 def read_config(config_file):

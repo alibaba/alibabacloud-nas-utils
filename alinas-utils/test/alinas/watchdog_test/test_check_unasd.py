@@ -19,6 +19,7 @@ from multiprocessing import Process, Event
 from mock import MagicMock, patch
 from mock_open import MockOpen
 import watchdog
+from watchdog import _cleanup_unmounted_logs_by_size, TOTAL_UNMOUNTED_LOG_MAX_SIZE
 
 FILE_PREFIX = 'eac-'
 BUILTIN_OPEN_FUNC = "builtins.open"
@@ -435,4 +436,102 @@ def test_check_unas_bindmount(mocker, tmpdir):
         mock_socket.return_value.recv.decode.return_value = "0"
         watchdog.check_unas_mounts(wd, str(state_file_dir))
 
+
+class TestCleanupBySize:
+
+    def _setup_environment(self, tmpdir, file_specs, active_mounts=[]):
+        """
+        :param tmpdir: pytest的临时目录
+        :param file_specs: 一个列表 格式: [('mount_name', 'sub_dir', 'file_name', size, age_in_seconds), ...]
+        :param active_mounts: 一个列表 处于活动的挂载列表
+        """
+        log_dir = tmpdir.mkdir("logs")
+        state_dir = tmpdir.mkdir("state")
+        
+        now = time.time()
+        
+        for mount_name, sub_dir, file_name, size, age in file_specs:
+            full_sub_dir_path = os.path.join(str(log_dir), mount_name, sub_dir)
+            
+            os.makedirs(full_sub_dir_path, exist_ok=True)
+            
+            file_path = os.path.join(full_sub_dir_path, file_name)
+            
+            with open(file_path, "wb") as f:
+                f.write(b'\0' * size)
+            
+            mtime = now - age
+            os.utime(file_path, (mtime, mtime))
+
+        for mount_name in active_mounts:
+            mount_path = os.path.join(str(log_dir), mount_name)
+            os.makedirs(mount_path, exist_ok=True)
+            
+            state_file_name = mount_name.replace('efc', 'eac')
+            state_dir.join(state_file_name).write("active")
+            
+        return str(log_dir), str(state_dir)
+
+    def test_cleanup_when_size_exceeds_limit(self, tmpdir, mocker):
+        one_mb = 1024 * 1024
+        
+
+        mocker.patch('watchdog.TOTAL_UNMOUNTED_LOG_MAX_SIZE', 2 * one_mb)
+        file_specs = [
+            # 已卸载的日志
+            ('efc-unmounted-1', 'efclog/12345641', 'oldest.log', one_mb, 3600), # 最旧 (1小时前)
+            ('efc-unmounted-1', 'efclog/78978979', 'older.log',  one_mb, 1800), # 次旧 (30分钟前)
+            ('efc-unmounted-2', 'vsclog/54564655', 'newest.log', one_mb, 60),   # 最新 (1分钟前)
+            # 活动挂载点的日志 (不应该被删除)
+            ('efc-active-1', 'efclog/sessionX', 'active.log', one_mb, 7200),  # 非常旧，但是是活动的
+        ]
+        
+        log_dir, state_dir = self._setup_environment(tmpdir, file_specs, active_mounts=['efc-active-1'])
+        
+        # 执行清理
+        _cleanup_unmounted_logs_by_size(log_file_dir=log_dir, state_file_dir=state_dir)
+        
+
+        # 1. 最旧的文件被删除了
+        path_oldest = os.path.join(log_dir, 'efc-unmounted-1', 'efclog/12345641', 'oldest.log')
+        assert not os.path.exists(path_oldest)
+        
+        # 2. 两个较新的未挂载文件不被删除
+        path_older = os.path.join(log_dir, 'efc-unmounted-1', 'efclog/78978979', 'older.log')
+        path_newest = os.path.join(log_dir, 'efc-unmounted-2', 'vsclog/54564655', 'newest.log')
+        assert os.path.exists(path_older)
+        assert os.path.exists(path_newest)
+        
+        # 3. 活动挂载点的文件不被删除
+        path_active = os.path.join(log_dir, 'efc-active-1', 'efclog/sessionX', 'active.log')
+        assert os.path.exists(path_active)
+
+        # 4. 因文件删除而产生的空目录应该被清理
+        assert not os.path.exists(os.path.join(log_dir, 'efc-unmounted-1', 'efclog/12345641'))
+        # 父目录 'efclog' 因为还有 'session2'，所以不应该被删除
+        assert os.path.exists(os.path.join(log_dir, 'efc-unmounted-1', 'efclog'))
+
+
+    def test_cleanup_when_size_within_limit(self, tmpdir, mocker):
+
+        one_mb = 1024 * 1024
+        
+        mocker.patch('watchdog.TOTAL_UNMOUNTED_LOG_MAX_SIZE', 5 * one_mb)
+
+        file_specs = [
+            ('efc-unmounted-1', 'efclog', 'old.log', one_mb, 3600),
+            ('efc-unmounted-2', 'vsclog', 'new.log', one_mb, 60),
+        ]
+        
+        log_dir, state_dir = self._setup_environment(tmpdir, file_specs)
+        
+        # 执行清理
+        _cleanup_unmounted_logs_by_size(log_file_dir=log_dir, state_file_dir=state_dir)
+        
+
+        # 所有文件还在
+        path_old = os.path.join(log_dir, 'efc-unmounted-1', 'efclog', 'old.log')
+        path_new = os.path.join(log_dir, 'efc-unmounted-2', 'vsclog', 'new.log')
+        assert os.path.exists(path_old)
+        assert os.path.exists(path_new)
 

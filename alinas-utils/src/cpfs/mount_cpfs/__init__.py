@@ -67,6 +67,7 @@ site.addsitedir(PACKAGE_PATH)
 try:
     import cpfs_nfs_common
     from cpfs_nfs_common import fatal_error
+    from cpfs_nfs_common import warning_info
 except ImportError:
     sys.stderr.write("not found aliyun cpfs path: {}cpfs_nfs_commmon".format(PACKAGE_PATH))
     sys.exit(-1)
@@ -92,9 +93,10 @@ ALINAS_LOCK = 'cpfs.lock'
 FS_ID_PATTERN = re.compile('^(?P<fs_id>[-0-9a-zA-Z.]+).cpfs.aliyuncs.com(?::(?P<path>/.*))?$')
 MP_URL_PATTERN = re.compile('^(?P<url>[-0-9a-zA-Z.]+)(?::(?P<path>/.*))?$')
 
-DEFAULT_STUNNEL_VERIFY_LEVEL = 2
-DEFAULT_STUNNEL_CAFILE = '/etc/aliyun/cpfs/alinas-utils.crt'
+DEFAULT_CAFILE = '/etc/aliyun/cpfs/alinas-utils.crt'
 DEFAULT_ALI_TIMEOUT = 45
+DEFAULT_MOUNT_PORT = 2049
+DEFAULT_TLS_MOUNT_PORT = 60000
 
 Mount = namedtuple('Mount', ['server', 'mountpoint', 'type', 'options', 'freq', 'passno'])
 
@@ -111,32 +113,14 @@ ALINAS_ONLY_OPTIONS = [
     'no_start_watchdog',
     'alitimeo',
     'hp_config_dir', # To specify ha proxy config path.
-    'unmount_grace_period_sec' # To specify unmount grace period for the exact mount point.
+    'unmount_grace_period_sec', # To specify unmount grace period for the exact mount point.
+    'mount_port' # The port for mount.
 ]
 
 UNSUPPORTED_OPTIONS = [
     'cafile',
     'capath',
 ]
-
-STUNNEL_GLOBAL_CONFIG = {
-    'fips': 'no',
-    'foreground': 'yes',
-    'socket': [
-        'l:SO_REUSEADDR=yes',
-        'a:SO_BINDTODEVICE=lo',
-    ],
-}
-
-STUNNEL_ALINAS_CONFIG = {
-    'client': 'yes',
-    'accept': '%s:%s',
-    'connect': '%s:12049',
-    'sslVersion': 'TLSv1.2',
-    'renegotiation': 'no',
-    'TIMEOUTbusy': '20',
-    'libwrap': 'no',
-}
 
 HAPROXY_CONFIG_TMPL = """
 global
@@ -152,8 +136,8 @@ frontend cpfs2049
     bind {proxy_ip}:{proxy_port}
     default_backend bk2049
 backend bk2049
-    server cpfs_primary {remote}:2049 maxconn 2048 check port 2049 inter 2s fall 8 rise 30 on-marked-up shutdown-backup-sessions
-    server cpfs_backup  {backup}:2049 maxconn 2048 check port 2049 inter 2s fall 8 rise 30 backup
+    server cpfs_primary {remote}:{mount_port} maxconn 2048 check port {mount_port} inter 2s fall 8 rise 30 on-marked-down shutdown-sessions on-marked-up shutdown-backup-sessions
+    server cpfs_backup  {backup}:{mount_port} maxconn 2048 check port {mount_port} inter 2s fall 8 rise 30 backup
 """
 
 HAPROXY_CONFIG_SSL_TMPL = """
@@ -173,8 +157,8 @@ frontend cpfs2049
     default_backend bk2049
 
 backend bk2049
-    server cpfs_primary {remote}:60000 maxconn 2048 check ssl ca-file {cafile} verify required inter 2s fall 8 rise 30 on-marked-up shutdown-backup-sessions
-    server cpfs_backup  {backup}:60000 maxconn 2048 check ssl ca-file {cafile} verify required inter 2s fall 8 rise 30 backup
+    server cpfs_primary {remote}:{mount_port} maxconn 2048 check ssl ca-file {cafile} verify required inter 2s fall 8 rise 30 on-marked-down shutdown-sessions on-marked-up shutdown-backup-sessions
+    server cpfs_backup  {backup}:{mount_port} maxconn 2048 check ssl ca-file {cafile} verify required inter 2s fall 8 rise 30 backup
 """
 
 WATCHDOG_SERVICE = 'aliyun-cpfs-mount-watchdog'
@@ -233,11 +217,30 @@ def validate_options(options):
         get_ali_timeout(options)
 
 
-def ip_is_used(ip, state_file_dir):
-    if not os.path.isdir(state_file_dir):
-        return False
+def check_hp_in_use_port(ip, port, state_file_dir=STATE_FILE_DIR):
+    pattern = r"^\s*bind\s+([\d\.]+):(\d+)"
+    for _, state_file in cpfs_nfs_common.get_state_files(state_file_dir).items():
+        state = cpfs_nfs_common.load_state_file(state_file_dir, state_file)
+        if not state:
+            continue
+        
+        hp_path = state.get('config_file')
+        if not hp_path or not os.path.exists(hp_path):
+            continue
+        
+        try:
+            with open(hp_path, 'r') as f:
+                content = f.read()
+        except (IOError, OSError) as e:
+            logging.warning('Failed to read config file %s: %s', hp_path, e)
+            continue
 
-    return any([sf.endswith(ip) for sf in os.listdir(state_file_dir)])
+        matches = re.findall(pattern, content, re.MULTILINE)
+
+        if any(hp_ip == ip and int(hp_port) == port for hp_ip, hp_port in matches):
+            return True
+    
+    return False
 
 
 def cpfs_port_is_used(ip, port):
@@ -246,31 +249,7 @@ def cpfs_port_is_used(ip, port):
     if rc == 0:
         return True
     else:
-        return False
-
-
-def choose_proxy_addr(config, state_file_dir=STATE_FILE_DIR):
-    port = config.getint(CONFIG_SECTION, 'proxy_port',
-                         default=PROXY_DEFAULT_PORT,
-                         minvalue=8000,
-                         maxvalue=65535)
-
-    for i in range(1, 256):
-        for j in range(1, 255):
-            try:
-                ip = '127.0.%d.%d' % (i, j)
-                if ip_is_used(ip, state_file_dir):
-                    continue
-
-                sock = socket.socket()
-                sock.bind((ip, port))
-                sock.close()
-                return ip, port
-            except socket.error:
-                continue
-
-    fatal_error('Failed to find a loopback ip from 127.0.1.1 ~ 127.0.255.254 with port %s' % port)
-
+        return check_hp_in_use_port(ip, port)
 
 def choose_cpfs_proxy_addr(config):
     ip = config.get(CONFIG_SECTION, 'cpfs_proxy_addr', default=CPFS_PROXY_DEFAULT_ADDR)
@@ -289,104 +268,6 @@ def choose_cpfs_proxy_addr(config):
             continue
 
     fatal_error('Failed to find a loopback port from %s ~ %s with ip %s' % cpfs_proxy_port_min, cpfs_proxy_port_max, ip)
-
-
-def serialize_stunnel_config(config, header=None):
-    lines = []
-
-    if header:
-        lines.append('[%s]' % header)
-
-    for k, v in config.items():
-        if type(v) is list:
-            for item in v:
-                lines.append('%s = %s' % (k, item))
-        else:
-            lines.append('%s = %s' % (k, v))
-
-    return lines
-
-
-def add_stunnel_ca_options(alinas_config, stunnel_cafile=DEFAULT_STUNNEL_CAFILE):
-    if not os.path.exists(stunnel_cafile):
-        fatal_error('Failed to find the alinas certificate authority file for verification',
-                    'Failed to find the alinas CAfile "%s"' % stunnel_cafile)
-    alinas_config['CAfile'] = stunnel_cafile
-
-
-def is_stunnel_option_supported(stunnel_output, stunnel_option_name):
-    supported = False
-    for line in stunnel_output:
-        if line.startswith(stunnel_option_name):
-            supported = True
-            break
-
-    if not supported:
-        logging.warning('stunnel does not support "%s"', stunnel_option_name)
-
-    return supported
-
-
-def get_version_specific_stunnel_options(_):
-    proc = subprocess.Popen(['stunnel', '-help'], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    proc.wait()
-    _, err = proc.communicate()
-
-    stunnel_output = err.decode('utf-8').splitlines()
-
-    check_host_supported = is_stunnel_option_supported(stunnel_output, 'checkHost')
-    ocsp_aia_supported = is_stunnel_option_supported(stunnel_output, 'OCSPaia')
-
-    return check_host_supported, ocsp_aia_supported
-
-
-def write_stunnel_config_file(config, state_file_dir, local_dns, tls_host, port, dns_name, verify_level,
-                              log_dir=LOG_DIR):
-    """
-    Serializes stunnel configuration to a file. Unfortunately this does not conform to Python's config file format,
-    so we have to hand-serialize it.
-    """
-
-    global_config = dict(STUNNEL_GLOBAL_CONFIG)
-    if config.getboolean(CONFIG_SECTION, 'stunnel_debug_enabled', default=False):
-        global_config['debug'] = 'debug'
-        global_config['output'] = os.path.join(log_dir, '%s.stunnel.log' % local_dns)
-
-    alinas_config = dict(STUNNEL_ALINAS_CONFIG)
-    alinas_config['accept'] = alinas_config['accept'] % (tls_host, port)
-    alinas_config['connect'] = alinas_config['connect'] % dns_name
-    alinas_config['verify'] = verify_level
-    if verify_level > 0:
-        add_stunnel_ca_options(alinas_config)
-
-    check_host_supported, ocsp_aia_supported = get_version_specific_stunnel_options(config)
-
-    tls_controls_message = 'WARNING: Your client lacks sufficient controls to properly enforce TLS. ' \
-                           'Please upgrade stunnel, or disable "%%s" in %s.' % CONFIG_FILE
-
-    if config.getboolean(CONFIG_SECTION, 'stunnel_check_cert_hostname', default=False):
-        if check_host_supported:
-            alinas_config['checkHost'] = dns_name
-        else:
-            fatal_error(tls_controls_message % 'stunnel_check_cert_hostname')
-
-    if config.getboolean(CONFIG_SECTION, 'stunnel_check_cert_validity', default=False):
-        if ocsp_aia_supported:
-            alinas_config['OCSPaia'] = 'yes'
-        else:
-            fatal_error(tls_controls_message % 'stunnel_check_cert_validity')
-
-    stunnel_config = '\n'.join(serialize_stunnel_config(global_config) +
-                               serialize_stunnel_config(alinas_config, 'alinas'))
-    logging.debug('Writing stunnel configuration:\n%s', stunnel_config)
-
-    stunnel_config_file = os.path.join(state_file_dir, 'stunnel-config.%s' % local_dns)
-
-    with open(stunnel_config_file, 'w') as f:
-        f.write(stunnel_config)
-
-    return stunnel_config_file
-
 
 def get_ali_timeout(options):
     timeout = options.get('alitimeo', DEFAULT_ALI_TIMEOUT)
@@ -418,25 +299,25 @@ def resolve_dns(dns):
         fatal_error('Failed to resolve dns: {0}'.format(dns))
 
 
-def write_haproxy_config_file(_, hp_config_dir, dns, proxy_ip, proxy_port, remote, backup, options, is_ssl=False):
+def write_haproxy_config_file(_, hp_config_dir, dns, proxy_ip, proxy_port, remote, backup, mount_port, options, is_ssl=False):
     """
     Serializes haproxy configuration to a file. Unfortunately this does not conform to Python's config file format,
     so we have to hand-serialize it.
     """
-    if is_ssl and not os.path.exists(DEFAULT_STUNNEL_CAFILE):
+    if is_ssl and not os.path.exists(DEFAULT_CAFILE):
         fatal_error('Failed to find the alinas certificate authority file for verification',
-                    'Failed to find the alinas CAfile "%s"' % DEFAULT_STUNNEL_CAFILE)
+                    'Failed to find the alinas CAfile "%s"' % DEFAULT_CAFILE)
     # Move CA file to the same folder as hp_config_dir in case security enhancement limits the location to read crt
-    CA_file_name = os.path.basename(DEFAULT_STUNNEL_CAFILE)
+    CA_file_name = os.path.basename(DEFAULT_CAFILE)
     CA_file = os.path.join(hp_config_dir, CA_file_name)
     try:
-        shutil.copy2(DEFAULT_STUNNEL_CAFILE, CA_file)
-        logging.debug("Copy file from %s to %s succeeded.", DEFAULT_STUNNEL_CAFILE, CA_file)
+        shutil.copy2(DEFAULT_CAFILE, CA_file)
+        logging.debug("Copy file from %s to %s succeeded.", DEFAULT_CAFILE, CA_file)
     except Exception as e:
-        logging.debug("Copy file from %s to %s failed with exception as %s.", DEFAULT_STUNNEL_CAFILE, CA_file, str(e))
-        CA_file = DEFAULT_STUNNEL_CAFILE
+        logging.debug("Copy file from %s to %s failed with exception as %s.", DEFAULT_CAFILE, CA_file, str(e))
+        CA_file = DEFAULT_CAFILE
 
-    haproxy_config = make_config(proxy_ip, proxy_port, remote, backup, options, is_ssl, CA_file)
+    haproxy_config = make_config(proxy_ip, proxy_port, remote, backup, mount_port, options, is_ssl, CA_file)
     logging.debug('Write haproxy configuration:\n%s', haproxy_config)
 
     haproxy_config_file = os.path.join(hp_config_dir, 'haproxy-config.%s' % dns)
@@ -448,20 +329,22 @@ def write_haproxy_config_file(_, hp_config_dir, dns, proxy_ip, proxy_port, remot
                  haproxy_config_file, dns, proxy_ip)
     return haproxy_config_file
 
-def make_config(proxy_ip, proxy_port, remote, backup, options, is_ssl, CA_file):
+def make_config(proxy_ip, proxy_port, remote, backup, mount_port, options, is_ssl, CA_file):
     if is_ssl:
         return HAPROXY_CONFIG_SSL_TMPL.format(timeout=get_ali_timeout(options),
                                               proxy_ip=proxy_ip,
                                               proxy_port=proxy_port,
                                               remote=remote,
                                               backup=backup,
+                                              mount_port=mount_port,
                                               cafile=CA_file)
     else:
         return HAPROXY_CONFIG_TMPL.format(timeout=get_ali_timeout(options),
                                         proxy_ip=proxy_ip,
                                         proxy_port=proxy_port,
                                         remote=remote,
-                                        backup=backup)
+                                        backup=backup,
+                                        mount_port=mount_port)
 
 def sign_state(state):
     import hashlib
@@ -674,10 +557,10 @@ def is_proxy_ready(ip, port):
         sk.close()
 
 
-def get_clientaddr(dns, ip):
+def get_clientaddr(dns, ip, port):
     sk = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
-        sk.connect((ip, 2049))
+        sk.connect((ip, port))
         return sk.getsockname()[0]
     except IOError:
         fatal_error('Connection to {0}({1}) failed, please check the network'.format(dns, ip))
@@ -697,7 +580,7 @@ def detect_haproxy_version():
     return output[0]
 
 @contextmanager
-def start_tx(tx_name, ctx, state_file_dir=STATE_FILE_DIR):
+def start_tx(tx_name, ctx, is_ssl, state_file_dir=STATE_FILE_DIR):
     start_watchdog(ctx)
 
     if not os.path.exists(state_file_dir):
@@ -713,7 +596,7 @@ def start_tx(tx_name, ctx, state_file_dir=STATE_FILE_DIR):
         ctx.options['proxy_port'] = port
         ctx.options['nas_ip'] = nas_ip
         ctx.options['backup_ip'] = backup_ip
-        ctx.options['clientaddr'] = get_clientaddr(ctx.dns, nas_ip)
+        ctx.options['clientaddr'] = get_clientaddr(ctx.dns, nas_ip, int(ctx.options.get('mount_port', DEFAULT_TLS_MOUNT_PORT if is_ssl else DEFAULT_MOUNT_PORT)))
         unmount_grace_period_sec_opt = ctx.options.get('unmount_grace_period_sec', None)
 
         tx = Tx(local_dns)
@@ -755,32 +638,6 @@ def start_tx(tx_name, ctx, state_file_dir=STATE_FILE_DIR):
                       os.path.join(state_file_dir, tmp_state_file[1:]))
 
 
-def bootstrap_tls(config, local_dns, dns_name, options, state_file_dir=STATE_FILE_DIR):
-    host = options['proxy']
-    port = options['proxy_port']
-    remote = options['nas_ip']
-
-    verify_level = int(options.get('verify', DEFAULT_STUNNEL_VERIFY_LEVEL))
-    options['verify'] = verify_level
-
-    stunnel_config_file = write_stunnel_config_file(config,
-                                                    state_file_dir,
-                                                    local_dns,
-                                                    host, port,
-                                                    remote,
-                                                    verify_level)
-
-    tunnel_args = ['stunnel', stunnel_config_file]
-
-    # launch the tunnel in a process group so if it has any child processes, they can be killed easily
-    # by the mount watchdog
-    logging.info('Starting TLS tunnel: "%s"', ' '.join(tunnel_args))
-    tunnel_proc = subprocess.Popen(tunnel_args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, preexec_fn=os.setsid)
-    logging.info('Started TLS tunnel, pid: %d', tunnel_proc.pid)
-
-    return stunnel_config_file, tunnel_proc, tunnel_args
-
-
 def bootstrap_proxy(config, dns_name, options, state_file_dir=STATE_FILE_DIR, is_ssl=False):
     proxy = options['proxy']
     port = options['proxy_port']
@@ -789,10 +646,11 @@ def bootstrap_proxy(config, dns_name, options, state_file_dir=STATE_FILE_DIR, is
 
     # ha proxy config dir choose: customer specify in options -> apparmor whitelisted path -> default
     hp_config_dir = load_ha_proxy_path(options, os.path.join('/etc/apparmor.d', 'usr.sbin.haproxy'), state_file_dir)
-    
+    mount_port = int(options.get('mount_port', DEFAULT_TLS_MOUNT_PORT if is_ssl else DEFAULT_MOUNT_PORT))
+
     logging.debug('haproxy config dir value is %s', hp_config_dir)
 
-    proxy_config_file = write_haproxy_config_file(config, hp_config_dir, dns_name, proxy, port, remote, backup, options, is_ssl)
+    proxy_config_file = write_haproxy_config_file(config, hp_config_dir, dns_name, proxy, port, remote, backup, mount_port, options, is_ssl)
 
     # the env is required, or the popen cannot find haproxy in some OS, I don't know why
     env = {'PATH': '/usr/sbin:/sbin:/usr/bin:/usr/local/bin:/usr/local/sbin'}
@@ -827,22 +685,19 @@ def get_apparmor_enforced_dir(profile_path):
             continue
         
         # regex to match path + permission
-        match = re.match(r'^(\S+)\s+([rwkldmxiuc]+),?\s*$', line)
+        match = re.match(r'^(/etc/\S*\*)\s+([wkldmxiuc]*r[wkldmxiuc]*),?\s*$', line)
         if not match:
             continue
         
         path_pattern = match.group(1)
         permissions = match.group(2)
-        
-        if 'r' in permissions:
-            # if path ends with '/' and ends with '/*'
-            if path_pattern.endswith('/'):
-                readable_dirs.add(path_pattern)
-            elif path_pattern.endswith('/*'):
-                readable_dirs.add(path_pattern[:-1])
-            else:
-                pass
-    
+        logging.info("Found path_pattern: %s and permission %s in apparmor config", path_pattern, permissions)
+        readable_dirs.add(path_pattern[:-1])
+
+    if not readable_dirs:
+        warning_info("Profile for apparmor is found, but no readable dirs is found. " \
+            "If error like PERMISSION DENIED is seen, please specify ha proxy config path (hp_config_dir) in options.")
+
     return next(iter(readable_dirs), None)
 
 
@@ -855,6 +710,7 @@ def load_ha_proxy_path(options, apparmor_ha_profile, default_config_dir):
         hp_config_dir = default_config_dir
     return hp_config_dir
 
+
 # Prerequisite: Please make sure config_file_path exists
 def is_sslconfig(config_file_path):
     with open(config_file_path, 'r') as f:
@@ -865,7 +721,23 @@ def is_sslconfig(config_file_path):
     else:
         return False
 
-def should_reuse_proxy(nas_dns, unmount_grace_period_sec_cfg, is_ssl=False, state_file_dir=STATE_FILE_DIR):
+
+# Prerequisite: Please make sure config_file_path exists
+def get_old_mount_port(config_file_path):
+    with open(config_file_path, 'r') as f:
+        content = f.read()
+     # 匹配server行中的IP:端口格式
+    server_pattern = r'^\s*server\s+\w+\s+((?:\d{1,3}\.){3}\d{1,3}):(\d{1,5})\s+maxconn'
+    matches = re.findall(server_pattern, content, re.MULTILINE)
+    
+    if matches:
+        _, last_port = matches[-1]
+        return last_port
+    else:
+        return DEFAULT_TLS_MOUNT_PORT if "check ssl ca-file" in content else DEFAULT_MOUNT_PORT
+
+
+def should_reuse_proxy(nas_dns, mount_port, unmount_grace_period_sec_cfg, is_ssl=False, state_file_dir=STATE_FILE_DIR):
     try:
         state = cpfs_nfs_common.load_state_file(state_file_dir, nas_dns)
         if not state:
@@ -880,13 +752,14 @@ def should_reuse_proxy(nas_dns, unmount_grace_period_sec_cfg, is_ssl=False, stat
             logging.info('Config path [%s] exists in state file, but not exist in file system.', state['config_file'])
             return False
         old_is_ssl = is_sslconfig(state['config_file'])
+        old_mount_port = int(get_old_mount_port(state['config_file']))
         # Cannot reuse proxy and need to kill the running one since it's not been terminated.
-        if is_ssl != old_is_ssl and not ha_proxy_terminating:
+        if (is_ssl != old_is_ssl or mount_port != old_mount_port) and not ha_proxy_terminating:
             if 'unmount_time' in state:
                 unmount_time = state['unmount_time']
-                fatal_error('Cannot mount with %s now, please wait %d seconds for the unmount to complete.' % ('tls' if is_ssl else 'non-tls', unmount_grace_period_sec - int(time.time() - unmount_time) + 1))
+                fatal_error('Cannot mount with %s and port %s now, please wait %d seconds for the unmount to complete.' % ('tls' if is_ssl else 'non-tls', mount_port, unmount_grace_period_sec - int(time.time() - unmount_time) + 1))
             else:
-                fatal_error('Cannot mount with %s now, no unmount_time information is found, please check your mounting state.' % ('tls' if is_ssl else 'non-tls'))
+                fatal_error('Cannot mount with %s and port %s now, no unmount_time information is found, please check your mounting state.' % ('tls' if is_ssl else 'non-tls', mount_port))
         if nas_dns == state_dns and not ha_proxy_terminating:
             return True
         else:
@@ -1005,7 +878,7 @@ def mount_tls(ctx):
                  ctx.mountpoint,
                  ctx.options)
 
-    with start_tx('Haproxy_ssl', ctx) as tx:
+    with start_tx('Haproxy_ssl', ctx, is_ssl=True) as tx:
         config_file, process, cmd = bootstrap_proxy(ctx.config, ctx.dns, ctx.options, is_ssl=True)
         tx.commit(config_file, process, cmd)
 
@@ -1018,23 +891,23 @@ def mount_nfs_proxy(ctx):
                  ctx.mountpoint,
                  ctx.options)
 
-    with start_tx('Haproxy', ctx) as tx:
+    with start_tx('Haproxy', ctx, is_ssl=False) as tx:
         config_file, process, cmd = bootstrap_proxy(ctx.config, ctx.dns, ctx.options)
         tx.commit(config_file, process, cmd)
 
 
-def mount_nfs_reuse_proxy(ctx):
+def mount_nfs_reuse_proxy(ctx, is_ssl):
     state = cpfs_nfs_common.load_state_file(STATE_FILE_DIR, ctx.dns)
     if not state:
         fatal_error("mount {0} error, please check state file in {1}".format(ctx.dns, STATE_FILE_DIR))
-    if not cpfs_nfs_common.is_pid_running(state['pid']):
+    if not cpfs_nfs_common.is_hp_running(state['pid'], ctx.dns):
         fatal_error("mount {0} error, please check haproxy pid {1} is running".format(ctx.dns, state['pid']))
 
     start_watchdog(ctx)
 
     ctx.options['proxy_port'] = state['proxy_port']
     ctx.options['proxy'] = state['local_ip']
-    ctx.options['clientaddr'] = get_clientaddr(ctx.dns, state['nas_ip'])
+    ctx.options['clientaddr'] = get_clientaddr(ctx.dns, state['nas_ip'], int(ctx.options.get('mount_port', DEFAULT_TLS_MOUNT_PORT if is_ssl else DEFAULT_MOUNT_PORT)))
 
     logging.info('Mount reuse haproxy: fs=%s, dns=%s, path=%s, mp=%s, options=%s',
                  ctx.fs_id,
@@ -1157,8 +1030,8 @@ def main():
         if TLS_ENABLED:
             with cpfs_nfs_common.lock_file(dns_name) as _:
                 check_unsupported_operations(dns_name, options)
-                if should_reuse_proxy(dns_name, unmount_grace_period_sec, is_ssl=True):
-                    mount_nfs_reuse_proxy(ctx)
+                if should_reuse_proxy(dns_name, int(options.get('mount_port', DEFAULT_TLS_MOUNT_PORT)), unmount_grace_period_sec, is_ssl=True):
+                    mount_nfs_reuse_proxy(ctx, is_ssl=True)
                 else:
                     mount_tls(ctx)
         else:
@@ -1169,8 +1042,8 @@ def main():
     else:
         with cpfs_nfs_common.lock_file(dns_name) as _:
             check_unsupported_operations(dns_name, options)
-            if should_reuse_proxy(dns_name, unmount_grace_period_sec):
-                mount_nfs_reuse_proxy(ctx)
+            if should_reuse_proxy(dns_name, int(options.get('mount_port', DEFAULT_MOUNT_PORT)), unmount_grace_period_sec):
+                mount_nfs_reuse_proxy(ctx, is_ssl=False)
             else:
                 mount_nfs_proxy(ctx)
 

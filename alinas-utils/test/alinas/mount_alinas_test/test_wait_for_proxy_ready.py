@@ -6,31 +6,34 @@
 # the License.
 #
 
-import socket
 import mount_alinas
 
 import pytest
-from mock import MagicMock
 
 
 def test_wait_for_proxy_ready_good(mocker):
-    mk = MagicMock()
-    mocker.patch('socket.socket', return_value=mk)
+    # mock execute_with_timeout to return stunnel listening on the expected ip:port
+    stdout = 'LISTEN  0  4096  127.0.1.1%lo:12049  0.0.0.0:*  users:(("stunnel",pid=2311460,fd=9))\n'
+    mocker.patch('mount_alinas.execute_with_timeout', return_value=(None, 0, stdout, None))
 
-    mount_alinas.wait_for_proxy_ready('a', 'b', 'c')
+    mount_alinas.wait_for_proxy_ready('a', '127.0.1.1', 12049)
 
-    mk.connect.assert_called_once()
-    mk.connect.assert_called_with(('b', 'c'))
-    mk.close.assert_called_once()
-
-
-def test_wait_for_proxy_ready_bad(mocker, capsys):
-    mk = MagicMock()
-    mk.connect.side_effect = socket.error()
-    mocker.patch('socket.socket', return_value=mk)
+def test_wait_for_proxy_mismatch(mocker, capsys):
+    stdout = 'LISTEN  0  4096  127.0.1.11%lo:12049  0.0.0.0:*  users:(("stunnel",pid=2311460,fd=9))\n'
+    mocker.patch('mount_alinas.execute_with_timeout', return_value=(None, 0, stdout, None))
 
     with pytest.raises(SystemExit) as e:
-        mount_alinas.wait_for_proxy_ready('a', 'b', 'c', 8)
+        mount_alinas.wait_for_proxy_ready('a', '127.0.1.1', 12049, 8)
+
+    out, err = capsys.readouterr()
+    assert 'Cannot start proxy for' in err
+
+def test_wait_for_proxy_ready_bad(mocker, capsys):
+    # mock execute_with_timeout to return rc != 0 (no stunnel listening)
+    mocker.patch('mount_alinas.execute_with_timeout', return_value=(None, 1, None, None))
+
+    with pytest.raises(SystemExit) as e:
+        mount_alinas.wait_for_proxy_ready('a', '127.0.1.1', 12049, 8)
 
     out, err = capsys.readouterr()
     assert 'Cannot start proxy for' in err

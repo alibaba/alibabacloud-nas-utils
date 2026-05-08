@@ -131,7 +131,7 @@ install -p -m 644 %{_builddir}/%{name}/dist/alinas/aliyun-alinas-efc-minimum-sup
 
 %config(noreplace) %{_sysconfdir}/aliyun/cpfs/cpfs-utils.conf
 %config(noreplace) %{_sysconfdir}/aliyun/alinas/alinas-utils.conf
-%config(noreplace) %{_sysconfdir}/aliyun/alinas/aliyun-alinas-efc-minimum-supported-kernel-versions.json
+%{_sysconfdir}/aliyun/alinas/aliyun-alinas-efc-minimum-supported-kernel-versions.json
 
 /usr/local/nas-agent
 /etc/nas-agent
