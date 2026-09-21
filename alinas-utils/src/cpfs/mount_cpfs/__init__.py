@@ -125,12 +125,19 @@ UNSUPPORTED_OPTIONS = [
 HAPROXY_CONFIG_TMPL = """
 global
     maxconn 4096
+    log /dev/log local0 info
+    stats socket {stats_socket} mode 600 level operator
+    stats timeout 30s
 defaults
     mode    tcp
     balance leastconn
-    timeout client      45s
+    log global
+    timeout client      {timeout}s
     timeout server      {timeout}s
     timeout connect     3s
+    timeout tunnel      45s
+    timeout server-fin  5s
+    timeout client-fin  5s
     retries 3
 frontend cpfs2049
     bind {proxy_ip}:{proxy_port}
@@ -143,13 +150,20 @@ backend bk2049
 HAPROXY_CONFIG_SSL_TMPL = """
 global
     maxconn 4096
+    log /dev/log local0 info
+    stats socket {stats_socket} mode 600 level operator
+    stats timeout 30s
 
 defaults
     mode    tcp
     balance leastconn
-    timeout client      45s
+    log global
+    timeout client      {timeout}s
     timeout server      {timeout}s
     timeout connect     3s
+    timeout tunnel      45s
+    timeout server-fin  5s
+    timeout client-fin  5s
     retries 3
 
 frontend cpfs2049
@@ -244,12 +258,14 @@ def check_hp_in_use_port(ip, port, state_file_dir=STATE_FILE_DIR):
 
 
 def cpfs_port_is_used(ip, port):
-    cmd = 'ss -ntap | grep -w {0}:{1}'.format(ip, port)
-    rc = subprocess.call(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    if rc == 0:
-        return True
-    else:
-        return check_hp_in_use_port(ip, port)
+    # Use ss built-in filter
+    cmd = 'ss -ntapH src {0}:{1} or dst {0}:{1}| grep -w {0}:{1}'.format(ip, port)
+    with open(os.devnull, 'w') as devnull:
+        rc = subprocess.call(cmd, shell=True, stdout=devnull, stderr=devnull)
+        if rc == 0:
+            return True
+    return check_hp_in_use_port(ip, port)
+
 
 def choose_cpfs_proxy_addr(config):
     ip = config.get(CONFIG_SECTION, 'cpfs_proxy_addr', default=CPFS_PROXY_DEFAULT_ADDR)
@@ -299,6 +315,170 @@ def resolve_dns(dns):
         fatal_error('Failed to resolve dns: {0}'.format(dns))
 
 
+import hashlib
+
+
+def _expand_apparmor_alternation(pattern):
+    """Expand AppArmor alternation syntax {a,b} and return all possible paths.
+
+    Example: /{,var/}run/haproxy.sock* ->
+        ['/run/haproxy.sock*', '/var/run/haproxy.sock*']
+    """
+    match = re.search(r'\{([^}]+)\}', pattern)
+    if not match:
+        return [pattern]
+
+    options = match.group(1).split(',')
+    results = []
+    for option in options:
+        expanded = pattern[:match.start()] + option + pattern[match.end():]
+        results.extend(_expand_apparmor_alternation(expanded))
+    return results
+
+
+def get_apparmor_writable_dir(profile_path):
+    """查找AppArmor配置中具有写权限的目录"""
+    if not os.path.exists(profile_path):
+        logging.debug('Trying to get apparmor writable dir, didn\'t find file path at %s', profile_path)
+        return None
+
+    writable_dirs = set()
+
+    with open(profile_path, 'r') as f:
+        lines = f.readlines()
+
+    for line in lines:
+        line = line.strip()
+
+        # skip comment line
+        if not line or line.startswith('#'):
+            continue
+
+        # regex to match optional qualifiers + path + permission
+        # path must contain at least one wildcard '*'
+        # permission must contain both 'r' (read) and 'w' (write), which are
+        # required for haproxy to create and use the stats socket, and for the
+        # watchdog to read it. 'l' (link) and 'k' (lock) are optional.
+        match = re.match(r'^\s*((?:audit|deny|owner|allow)\s+)*\s*(/[^#\s]*\*[^#\s]*)\s+([a-z]*),?\s*$', line)
+        if not match:
+            continue
+
+        permissions = match.group(3)
+        if 'r' not in permissions or 'w' not in permissions:
+            continue
+
+        # skip deny rules (e.g. "deny /path/* w," or "audit deny /path/* w,")
+        qualifiers_prefix = line[:match.start(2)]
+        if 'deny' in qualifiers_prefix:
+            continue
+
+        path_pattern = match.group(2)
+
+        # Expand alternation and pick the first option that is not a system directory.
+        # This avoids losing valid paths like /var/run/ when /run/ is excluded.
+        expanded_options = _expand_apparmor_alternation(path_pattern)
+        selected = None
+        for expanded in expanded_options:
+            if not expanded.startswith(('/sys/', '/proc/', '/dev/', '/run/', '/tmp/', '/var/tmp/')):
+                selected = expanded
+                break
+        if selected is None:
+            continue
+
+        logging.info("Found writable path_pattern: %s (selected: %s) in apparmor config", path_pattern, selected)
+        writable_dirs.add(selected)
+
+    if not writable_dirs:
+        warning_info("Profile for apparmor is found, but no writable dirs is found. " \
+            "If error like PERMISSION DENIED is seen, please specify ha proxy config path (hp_config_dir) in options.")
+
+    return next(iter(writable_dirs), None)
+
+
+def get_haproxy_socket_name(dns, options=None, state_file_dir=STATE_FILE_DIR,
+                            apparmor_profile_path=None):
+    """生成 HAProxy stats socket 文件名，使用 dns 的 MD5 前 8 位"""
+    if apparmor_profile_path is None:
+        apparmor_profile_path = os.path.join('/etc/apparmor.d', 'usr.sbin.haproxy')
+
+    hash_str = hashlib.md5(dns.encode('utf-8')).hexdigest()[:8]
+
+    # 对于socket文件，我们需要一个可写的目录，而不是配置文件的目录
+    if options is not None:
+        # 获取AppArmor可写路径模式
+        apparmor_pattern = get_apparmor_writable_dir(apparmor_profile_path)
+        if apparmor_pattern:
+            # 根据AppArmor配置中的路径模式生成socket文件名
+            socket_path = construct_path_from_pattern(apparmor_pattern, hash_str)
+            # 确保目录存在
+            socket_dir = os.path.dirname(socket_path)
+            os.makedirs(socket_dir, exist_ok=True)
+            return socket_path
+        else:
+            # 如果没有AppArmor配置或没找到可写目录，则使用load_ha_proxy_path的默认结果
+            socket_dir = load_ha_proxy_path(options, apparmor_profile_path, state_file_dir)
+    else:
+        socket_dir = state_file_dir  # 使用默认目录作为fallback
+
+    # 确保socket_dir是目录，如果是文件则使用其父目录
+    if os.path.isfile(socket_dir):
+        socket_dir = os.path.dirname(socket_dir)
+
+    # 确保目录存在
+    os.makedirs(socket_dir, exist_ok=True)
+
+    # 默认情况下使用标准命名
+    return os.path.join(socket_dir, 'haproxy-%s.sock' % hash_str)
+
+
+def construct_path_from_pattern(pattern, hash_str):
+    """根据AppArmor路径模式构造实际的文件路径"""
+    # Expand AppArmor alternation syntax and pick the first option.
+    # Caller (get_apparmor_writable_dir) has already filtered out excluded paths.
+    pattern = _expand_apparmor_alternation(pattern)[0]
+
+    # 没有通配符：将pattern视为目录，在其下创建socket文件。
+    # 实际使用中，get_apparmor_writable_dir 只返回包含 '*' 的pattern，
+    # 此分支为防御性处理。
+    if '*' not in pattern:
+        return os.path.join(pattern, 'haproxy-%s.sock' % hash_str)
+
+    # 多个通配符的情况：将socket放在第一个通配符之前的目录中。
+    # 例如 /var/lib/*/*.sock -> /var/lib/haproxy-hash.sock
+    # 例如 /var/lib/haproxy/** -> /var/lib/haproxy/haproxy-hash.sock
+    if pattern.count('*') > 1:
+        prefix_before_first_star = pattern.split('*', 1)[0]
+        dir_part = os.path.dirname(prefix_before_first_star)
+        return os.path.join(dir_part, 'haproxy-%s.sock' % hash_str)
+
+    prefix, suffix = pattern.split('*', 1)
+
+    # /path/* 这种形式
+    if not suffix:
+        if prefix.endswith('/'):
+            return os.path.join(prefix, 'haproxy-%s.sock' % hash_str)
+        else:
+            dir_part = os.path.dirname(prefix)
+            base = os.path.basename(prefix)
+            return os.path.join(dir_part, '%s-haproxy-%s' % (base, hash_str))
+
+    # /path/*.suffix 或 /path/prefix*.suffix 形式
+    dir_part = os.path.dirname(prefix)
+    base = os.path.basename(prefix)
+
+    if not base:
+        # /*.suffix
+        file_name = 'haproxy-%s%s' % (hash_str, suffix)
+    elif base.endswith('.'):
+        # prefix. + *.suffix -> prefix.haproxy-hash.suffix
+        file_name = base + 'haproxy-%s%s' % (hash_str, suffix)
+    else:
+        # prefix + *.suffix -> prefix-haproxy-hash.suffix
+        file_name = '%s-haproxy-%s%s' % (base, hash_str, suffix)
+
+    return os.path.join(dir_part, file_name)
+
+
 def write_haproxy_config_file(_, hp_config_dir, dns, proxy_ip, proxy_port, remote, backup, mount_port, options, is_ssl=False):
     """
     Serializes haproxy configuration to a file. Unfortunately this does not conform to Python's config file format,
@@ -317,7 +497,8 @@ def write_haproxy_config_file(_, hp_config_dir, dns, proxy_ip, proxy_port, remot
         logging.debug("Copy file from %s to %s failed with exception as %s.", DEFAULT_CAFILE, CA_file, str(e))
         CA_file = DEFAULT_CAFILE
 
-    haproxy_config = make_config(proxy_ip, proxy_port, remote, backup, mount_port, options, is_ssl, CA_file)
+    stats_socket = get_haproxy_socket_name(dns, options, hp_config_dir)
+    haproxy_config = make_config(proxy_ip, proxy_port, remote, backup, mount_port, options, is_ssl, CA_file, stats_socket)
     logging.debug('Write haproxy configuration:\n%s', haproxy_config)
 
     haproxy_config_file = os.path.join(hp_config_dir, 'haproxy-config.%s' % dns)
@@ -329,9 +510,10 @@ def write_haproxy_config_file(_, hp_config_dir, dns, proxy_ip, proxy_port, remot
                  haproxy_config_file, dns, proxy_ip)
     return haproxy_config_file
 
-def make_config(proxy_ip, proxy_port, remote, backup, mount_port, options, is_ssl, CA_file):
+def make_config(proxy_ip, proxy_port, remote, backup, mount_port, options, is_ssl, CA_file, stats_socket):
     if is_ssl:
-        return HAPROXY_CONFIG_SSL_TMPL.format(timeout=get_ali_timeout(options),
+        return HAPROXY_CONFIG_SSL_TMPL.format(stats_socket=stats_socket,
+                                              timeout=get_ali_timeout(options),
                                               proxy_ip=proxy_ip,
                                               proxy_port=proxy_port,
                                               remote=remote,
@@ -339,7 +521,8 @@ def make_config(proxy_ip, proxy_port, remote, backup, mount_port, options, is_ss
                                               mount_port=mount_port,
                                               cafile=CA_file)
     else:
-        return HAPROXY_CONFIG_TMPL.format(timeout=get_ali_timeout(options),
+        return HAPROXY_CONFIG_TMPL.format(stats_socket=stats_socket,
+                                        timeout=get_ali_timeout(options),
                                         proxy_ip=proxy_ip,
                                         proxy_port=proxy_port,
                                         remote=remote,
@@ -382,7 +565,8 @@ def write_state_file(local_dns, ctx, tunnel_pid, command, config_file, files, st
         'backup_ip': ctx.options['backup_ip'],
         'proxy_port': ctx.options['proxy_port'],
         'mountpoint': os.path.abspath(ctx.mountpoint),
-        'timeo': get_ali_timeout(ctx.options)
+        'timeo': get_ali_timeout(ctx.options),
+        'stats_socket': get_haproxy_socket_name(local_dns, ctx.options, state_file_dir)
     }
     if (unmount_grace_period_sec is not None):
         state['unmount_grace_period_sec'] = unmount_grace_period_sec
@@ -679,20 +863,46 @@ def get_apparmor_enforced_dir(profile_path):
 
     for line in lines:
         line = line.strip()
-        
+
         # skip comment line
         if not line or line.startswith('#'):
             continue
-        
-        # regex to match path + permission
-        match = re.match(r'^(/etc/\S*\*)\s+([wkldmxiuc]*r[wkldmxiuc]*),?\s*$', line)
+
+        # regex to match optional qualifiers + path + permission
+        # path must contain at least one wildcard '*'
+        # permission must contain 'r' (read)
+        match = re.match(r'^\s*((?:audit|deny|owner|allow)\s+)*\s*(/[^#\s]*\*[^#\s]*)\s+([a-z]*r[a-z]*),?\s*$', line)
         if not match:
             continue
-        
-        path_pattern = match.group(1)
-        permissions = match.group(2)
-        logging.info("Found path_pattern: %s and permission %s in apparmor config", path_pattern, permissions)
-        readable_dirs.add(path_pattern[:-1])
+
+        # skip deny rules
+        qualifiers_prefix = line[:match.start(2)]
+        if 'deny' in qualifiers_prefix:
+            continue
+
+        path_pattern = match.group(2)
+
+        # Expand alternation and pick the first option under /etc/
+        expanded_options = _expand_apparmor_alternation(path_pattern)
+        selected = None
+        for expanded in expanded_options:
+            if expanded.startswith('/etc/'):
+                selected = expanded
+                break
+        if selected is None:
+            continue
+
+        permissions = match.group(3)
+        logging.info("Found path_pattern: %s (selected: %s) and permission %s in apparmor config",
+                     path_pattern, selected, permissions)
+
+        # Extract the directory part before the first wildcard
+        prefix_before_star = selected.split('*', 1)[0]
+        if prefix_before_star.endswith('/'):
+            dir_path = prefix_before_star
+        else:
+            dir_path = os.path.dirname(prefix_before_star) + '/'
+        readable_dirs.add(dir_path)
 
     if not readable_dirs:
         warning_info("Profile for apparmor is found, but no readable dirs is found. " \
@@ -1037,7 +1247,9 @@ def main():
         else:
             fatal_error('TLS is not supported in the current version, please contact Aliyun NAS Team')
     elif 'direct' in options:
-        mount_nfs_directly(dns_name, path, mountpoint, options)
+        nas_ip, backup_ip = cpfs_nfs_common.resolve_cpfs_dns(dns_name)
+        logging.info('Resolved %s to nas_ip=%s, backup_ip=%s', dns_name, nas_ip, backup_ip)
+        mount_nfs_directly(nas_ip, path, mountpoint, options)
 
     else:
         with cpfs_nfs_common.lock_file(dns_name) as _:

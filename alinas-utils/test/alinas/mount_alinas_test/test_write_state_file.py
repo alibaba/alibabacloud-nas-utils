@@ -8,6 +8,7 @@
 #
 
 import mount_alinas
+import process_probe
 import json
 import os
 from datetime import datetime
@@ -61,6 +62,27 @@ def test_write_state_file(mocker, tmpdir):
     saved_sign = state.pop(mount_alinas.STATE_SIGN, '')
     computed_sign = mount_alinas.sign_state(state)
     assert saved_sign == computed_sign
+
+
+def test_write_state_file_records_process_starttime(mocker, tmpdir):
+    state_file_dir = str(tmpdir)
+    mocker.patch('mount_alinas.resolve_dns', return_value=NAS_IP)
+    mocker.patch(
+        'mount_alinas.process_probe.read_process_identity',
+        return_value=process_probe.ProcessIdentity(
+            PID, 'S', 9876, 'stunnel', '/usr/bin/stunnel'),
+    )
+    ctx = mount_alinas.MountContext(
+        'config', 'init', NAS_DNS, 'fs_id', 'path', MNT, None,
+        {'proxy': PROXY, 'nas_ip': NAS_IP},
+    )
+
+    state_file = mount_alinas.write_state_file(
+        LOCAL_DNS, ctx, PID, COMMAND, CONFIG_FILE, FILES, state_file_dir)
+
+    with open(os.path.join(state_file_dir, state_file)) as stream:
+        state = json.load(stream)
+    assert state[mount_alinas.PROCESS_STARTTIME] == 9876
 
 def test_write_state_file_with_cert(mocker, tmpdir):
     state_file_dir = str(tmpdir)
@@ -141,4 +163,3 @@ def test_write_unas_state_file(mocker, tmpdir):
 
     state = mount_alinas.load_unas_state_file(state_file_dir, state_file)
     assert mount_uuid == state['mountuuid']
-

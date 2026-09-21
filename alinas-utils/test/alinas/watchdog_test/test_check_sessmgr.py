@@ -14,7 +14,8 @@ import watchdog
 
 def _mock_popen(mocker, returncode=0, returnmsg=''):
     popen_mock = MagicMock()
-    popen_mock.communicate.return_value = (returnmsg, 'stderr', )
+    popen_mock.communicate.return_value = (
+        returnmsg.encode('utf-8'), b'stderr', )
     popen_mock.returncode = returncode
     return mocker.patch('subprocess.Popen', return_value=popen_mock)
 
@@ -31,25 +32,22 @@ def test_create_sessmgr_log_file(mocker):
 
 def test_check_unas_sessmgr_dead(mocker, tmpdir):
     # sessmgr not alive
-    tmpdir.join('test').write('')
-    fd = open(str(tmpdir) + '/test')
-
-    mock = mocker.patch("os.popen", return_value=fd)
+    mocker.patch(
+        'watchdog.process_probe.find_processes_by_exe', return_value=[])
     pmock = _mock_popen(mocker, 0, '')
     mocker.patch('watchdog.create_sessmgr_log_file', return_value='default')
     
     watchdog.check_unas_sessmgr('STATE_FILE_DIR')
     assert pmock.call_count == 1 
-    fd.close()
 
 def test_check_unas_sessmgr_alive(mocker, tmpdir):
-    tmpdir.join('test').write('sessmgr')
-    fd = open(str(tmpdir) + '/test')
-    mock = mocker.patch("os.popen", return_value=fd)
+    mocker.patch(
+        'watchdog.process_probe.find_processes_by_exe',
+        return_value=[mocker.Mock()],
+    )
 
     pmock = _mock_popen(mocker, 0, 'sessmgr')
     # sessmgr alive
     pmock.communicate.return_value = ('sessmgr', '', )
     watchdog.check_unas_sessmgr('STATE_FILE_DIR')
     assert pmock.call_count == 0
-    fd.close()

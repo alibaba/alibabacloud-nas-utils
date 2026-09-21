@@ -20,6 +20,12 @@
             "interval": 180,
             "description": "version of alinas utils"
         },
+        "efc_rpm_version": {
+            "version": "0.0.1",
+            "task": "command -v yum >/dev/null 2>&1 && (yum list installed alinas-efc | grep alinas-efc | awk '{ print $2 }' ) || (dpkg -l | grep alinas-efc | awk '{ print $3 }')",
+            "interval": 180,
+            "description": "version of alinas efc rpm"
+        },
         "efc_and_fuse_version": {
             "version": "0.0.1",
             "task": "((aliyun-alinas-efc --version | grep efc | awk '{ print $NF }') && if lsmod | grep alifuse > /dev/null; then echo alifuse; else echo fuse; fi && cat /sys/module/fuse/srcversion) | tr '\\n' ' ' | awk '{ print $1, $2 \"(\" $3 \")\" }'",
@@ -86,7 +92,7 @@
         },
         "system_cpu_util": {
             "version": "0.0.1",
-            "task": "vmstat | tail -n 1 | awk '{ print 100 - $15 }'",
+            "task": "vmstat 1 2 | tail -n 1 | awk '{ print 100 - $15 }'",
             "interval": 10,
             "description": "the cpu utilization"
         },
@@ -142,8 +148,28 @@
             "interval": 600,
             "description": "serial number"
         },
-        "efc_mount_parameters": {
+        "eci_id": {
             "version": "0.0.1",
+            "precondition": "test -f /etc/eci-agent/userdata.json",
+            "task": "jq -r '.eciID' /etc/eci-agent/userdata.json",
+            "interval": 180,
+            "descripton": "eci instance id"
+        },
+        "ecs_metadata": {
+            "version": "0.0.1",
+            "precondition": "TOKEN=$(curl -fsS -X PUT --connect-timeout 1 --max-time 1 'http://100.100.100.200/latest/api/token' -H 'X-aliyun-ecs-metadata-token-ttl-seconds:21600') && test -n \"$TOKEN\"",
+            "task": "TOKEN=$(curl -fsS -X PUT --connect-timeout 1 --max-time 1 'http://100.100.100.200/latest/api/token' -H 'X-aliyun-ecs-metadata-token-ttl-seconds:21600') && test -n \"$TOKEN\" && for META_PATH in instance-id instance/instance-type region-id zone-id; do VALUE=$(curl -fsS --connect-timeout 1 --max-time 1 -H \"X-aliyun-ecs-metadata-token: $TOKEN\" \"http://100.100.100.200/latest/meta-data/$META_PATH\") && test -n \"$VALUE\" || exit 1; printf '%s ' \"$VALUE\"; done",
+            "rules": [
+                { "name": "ecs_instance_id", "index": 1, "type": "raw" },
+                { "name": "instance_type", "index": 2, "type": "raw" },
+                { "name": "region_id", "index": 3, "type": "raw" },
+                { "name": "zone_id", "index": 4, "type": "raw" }
+            ],
+            "interval": 300,
+            "description": "ecs instance metadata"
+        },
+        "efc_mount_parameters": {
+			"version": "0.0.1",
             "target": "mount_parameters",
             "client_type": "efc",
             "task": "cat /var/run/alinas/e[af]c-<uuid>",
@@ -2755,27 +2781,8 @@
             "version": "0.0.1",
             "target": "total_reqs",
             "client_type": "efc",
-            "task": "cat /sys/fs/fuse/connections/<connid>/stats | tr [:upper:] [:lower:] | grep -v summary | sort | sed -r 's/.*total reqs: ([0-9]*).*/\\1/g' | tr '\\n' ' '",
-            "rules": [
-                { "name": "access", "index": 1, "type": "raw" },
-                { "name": "create", "index": 2, "type": "raw" },
-                { "name": "flush", "index": 3, "type": "raw" },
-                { "name": "fsync", "index": 4, "type": "raw" },
-                { "name": "getattr", "index": 5, "type": "raw" },
-                { "name": "lookup", "index": 6, "type": "raw" },
-                { "name": "mkdir", "index": 7, "type": "raw" },
-                { "name": "mknod", "index": 8, "type": "raw" },
-                { "name": "open", "index": 9, "type": "raw" },
-                { "name": "readdirplus", "index": 10, "type": "raw" },
-                { "name": "readdir", "index": 11, "type": "raw" },
-                { "name": "read", "index": 12, "type": "raw" },
-                { "name": "release", "index": 13, "type": "raw" },
-                { "name": "rename", "index": 14, "type": "raw" },
-                { "name": "rmdir", "index": 15, "type": "raw" },
-                { "name": "setattr", "index": 16, "type": "raw" },
-                { "name": "unlink", "index": 17, "type": "raw" },
-                { "name": "write", "index": 18, "type": "raw" }
-            ],
+            "task": "cat /sys/fs/fuse/connections/<connid>/stats | tr [:upper:] [:lower:] | grep -v summary | sort ",
+            "rules": "user_define",
             "interval": 10,
             "description": "total fuse requests completed"
         },
@@ -5980,6 +5987,28 @@
             ],
             "interval": 10,
             "description": "meta cache information"
+        },
+        "cache_media": {
+            "version": "0.0.1",
+            "client_type": "efc",
+            "precondition": "aliyun-alinas-efc-cli -s /var/run/efc/<uuid>.monitor.sock -r query -k support-cache-media",
+            "task": "aliyun-alinas-efc-cli -s /var/run/efc/<uuid>.monitor.sock -r cache-media -j --window 10",
+            "format": "json",
+            "key": "response",
+            "rules": [
+                { "name": "block_count", "type": "raw" },
+                { "name": "memory_size", "type": "raw" },
+                { "name": "disk_size", "type": "raw" },
+                { "name": "total_disk_read_size", "type": "raw" },
+                { "name": "total_disk_write_size", "type": "raw" },
+                { "name": "disk_hit_average_latency", "type": "raw" },
+                { "name": "disk_hit_maximum_latency", "type": "raw" },
+                { "name": "memory_hit_qps", "type": "raw" },
+                { "name": "disk_hit_qps", "type": "raw" },
+                { "name": "miss_qps", "type": "raw" }
+            ],
+            "interval": 10,
+            "descripton": "cache media information"
         },
         "stunnel_process_count": {
             "version": "0.0.1",

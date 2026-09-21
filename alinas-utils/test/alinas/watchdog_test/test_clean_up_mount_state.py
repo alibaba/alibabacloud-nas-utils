@@ -11,6 +11,9 @@ import watchdog
 import json
 import os
 import tempfile
+import logging
+
+import pytest
 
 PID = 99999999999999999
 
@@ -188,3 +191,66 @@ def test_clean_up_mount_state_dir_skip(mocker, tmpdir):
 
     rm_tree.assert_not_called()
     assert not os.path.exists(abs_state_file)
+
+
+def test_cleanup_cancels_when_state_changed(mocker, tmpdir):
+    expected_state = {
+        'pid': PID,
+        'pid_starttime': 100,
+        'cmd': ['stunnel', '/tmp/old.conf'],
+    }
+    current_state = dict(expected_state)
+    current_state['pid_starttime'] = 200
+    state_file_dir, state_file, abs_state_file = create_state_file(tmpdir)
+    state_loader = mocker.Mock(return_value=current_state)
+    signal_proxy = mocker.patch(
+        'watchdog.signal_stunnel_process_group_if_same')
+
+    assert watchdog.clean_up_mount_state(
+        state_file_dir, state_file, PID, True,
+        state=expected_state,
+        process_identity=mocker.Mock(),
+        state_loader=state_loader,
+    ) is False
+
+    signal_proxy.assert_not_called()
+    assert os.path.exists(abs_state_file)
+
+
+def test_cleanup_defers_when_process_probe_is_unknown(mocker, tmpdir):
+    state = {
+        'pid': PID,
+        'pid_starttime': 100,
+        'cmd': ['stunnel', '/tmp/stunnel.conf'],
+    }
+    state_file_dir, state_file, abs_state_file = create_state_file(tmpdir)
+    state_loader = mocker.Mock(return_value=state)
+    mocker.patch(
+        'watchdog.probe_stunnel_process',
+        return_value=watchdog.StunnelProbeResult(
+            watchdog.STUNNEL_UNKNOWN, None, 'procfs unavailable'))
+    signal_proxy = mocker.patch(
+        'watchdog.signal_stunnel_process_group_if_same')
+
+    assert watchdog.clean_up_mount_state(
+        state_file_dir, state_file, PID, False,
+        state=state,
+        state_loader=state_loader,
+    ) is False
+
+    signal_proxy.assert_not_called()
+    assert os.path.exists(abs_state_file)
+
+
+@pytest.mark.parametrize('group', [123, None])
+def test_verified_proxy_termination_preserves_log(mocker, caplog, group):
+    caplog.set_level(logging.INFO)
+    state = {'pid': PID}
+    mocker.patch('watchdog.signal_stunnel_process_group_if_same', return_value=group)
+    mocker.patch('watchdog.probe_stunnel_process', return_value=watchdog.StunnelProbeResult(
+        watchdog.STUNNEL_RUNNING, None, 'still running'))
+    assert watchdog.clean_up_mount_state('/unused', 'state', PID, True, state=state) is False
+    messages = [(r.levelno, r.getMessage()) for r in caplog.records
+                if r.getMessage().startswith('Terminating running proxy - ')]
+    assert messages == ([(logging.INFO,
+        'Terminating running proxy - PID: %d, group ID: 123' % PID)] if group else [])

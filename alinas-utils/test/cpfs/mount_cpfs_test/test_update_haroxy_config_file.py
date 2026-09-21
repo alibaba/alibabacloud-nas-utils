@@ -21,7 +21,7 @@ PRIMARY = '       server cpfs_primary {}:2049 maxconn 2048 check port 2049 inter
 BACKUP = '       server cpfs_backup  {}:2049 maxconn 2048 check port 2049 inter 2s fall 8 rise 30 backup'
 
 
-def test_try_update_haproxy_config_line(mocker):
+def test_try_update_haproxy_config_line():
     old_primary_line = PRIMARY.format('10.10.2.233')
     new_primary_line = PRIMARY.format('10.10.2.234')
     line = cpfs_nfs_common.try_update_haproxy_config_line(old_primary_line, cpfs_nfs_common.CPFS_PRIMARY, '10.10.2.23', '10.10.2.234')
@@ -39,3 +39,19 @@ def test_try_update_haproxy_config_line(mocker):
     assert line == new_backup_line
     line = cpfs_nfs_common.try_update_haproxy_config_line(old_backup_line, cpfs_nfs_common.CPFS_PRIMARY, '10.10.2.1', '10.10.2.123')
     assert line == old_backup_line
+
+
+PRIMARY_60000 = '       server cpfs_primary {}:60000 maxconn 2048 check port 60000 inter 2s fall 8 rise 30 on-marked-up shutdown-backup-sessions'
+BACKUP_60000 = '       server cpfs_backup  {}:60000 maxconn 2048 check port 60000 inter 2s fall 8 rise 30 backup'
+
+
+def test_try_update_haproxy_config_line_preserves_port():
+    old_primary_line = PRIMARY_60000.format('10.10.2.233')
+    new_primary_line = PRIMARY_60000.format('10.10.2.234')
+    line = cpfs_nfs_common.try_update_haproxy_config_line(old_primary_line, cpfs_nfs_common.CPFS_PRIMARY, '10.10.2.233', '10.10.2.234')
+    assert line == new_primary_line
+
+    old_backup_line = BACKUP_60000.format('10.10.2.12')
+    new_backup_line = BACKUP_60000.format('10.10.2.123')
+    line = cpfs_nfs_common.try_update_haproxy_config_line(old_backup_line, cpfs_nfs_common.CPFS_BACKUP, '10.10.2.12', '10.10.2.123')
+    assert line == new_backup_line

@@ -7,10 +7,14 @@ import logging
 from logging.handlers import RotatingFileHandler
 import argparse
 import subprocess
+import shutil
 from collections import namedtuple
 import re
 
 LOG_FILEPATH = '/var/log/efc-ops-cli-upgrade.log'
+WATCHDOG_SERVICE = 'aliyun-alinas-mount-watchdog.service'
+WATCHDOG_SCRIPT_PATH = '/usr/bin/aliyun-alinas-mount-watchdog'
+PROCESS_PROBE_PATH = '/opt/aliyun/alinas/process_probe.py'
 
 def bootstrap_logging():
     max_bytes = 1048576
@@ -51,12 +55,27 @@ def run(run_type):
     if run_type == 'prehook' or run_type == 'watch':
         return
 
-    # restart watchdog
-    ret, pid = popen('pgrep -f aliyun-alinas-mount-watchdog')
+    systemctl = shutil.which('systemctl')
+    if systemctl:
+        # reload slice file and restart the service without inspecting processes
+        popen([systemctl, 'daemon-reload'])
+        ret, output = popen([systemctl, 'restart', WATCHDOG_SERVICE])
+        if ret != 0:
+            fatal_error(f'failed to restart aliyun-alinas-mount-watchdog: {output}')
+        logging.warning('restarted aliyun-alinas-mount-watchdog with systemctl')
+        return
+
+    # Non-systemd environments rely on their existing supervisor to respawn
+    # the watchdog after an exact, revalidated procfs match is killed.
+    ret, output = popen([
+        sys.executable,
+        PROCESS_PROBE_PATH,
+        'kill-script',
+        WATCHDOG_SCRIPT_PATH,
+    ])
     if ret != 0:
-        fatal_error(f'failed to get aliyun-alinas-mount-watchdog processid')
-    ret, _ = popen(f'kill -9 {pid}')
-    logging.warning(f'restarted watchdog, pid:{pid}')
+        fatal_error(f'failed to signal aliyun-alinas-mount-watchdog: {output}')
+    logging.warning('signaled aliyun-alinas-mount-watchdog with process_probe')
 
 
 def main():

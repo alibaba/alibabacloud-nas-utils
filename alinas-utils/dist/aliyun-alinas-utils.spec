@@ -35,6 +35,7 @@ Requires  : openssl >= 1.0.2
 Requires  : bind-utils
 Requires  : iproute
 Requires  : %{python_requires}
+Recommends: numactl
 
 %if %{with_systemd}
 BuildRequires    : systemd
@@ -73,6 +74,7 @@ mkdir -p %{buildroot}%{_localstatedir}/log/aliyun/alinas
 mkdir -p %{buildroot}%{_localstatedir}/log/aliyun/cpfs
 mkdir -p %{buildroot}/opt/aliyun/cpfs
 mkdir -p %{buildroot}/opt/aliyun/cpfs/tools
+mkdir -p %{buildroot}/opt/aliyun/alinas
 mkdir -p %{buildroot}/usr/local/nas-agent
 mkdir -p %{buildroot}/etc/nas-agent
 
@@ -83,6 +85,8 @@ install -p -m 755 %{_builddir}/%{name}/src/alinas/mount_alinas/umount.efc.sh %{b
 install -p -m 755 %{_builddir}/%{name}/src/alinas/mount_alinas/umount.efc.sh %{buildroot}/sbin/umount.alifuse.aliyun-alinas-eac
 install -p -m 755 %{_builddir}/%{name}/src/alinas/mount_alinas/umount.efc.sh %{buildroot}/sbin/umount.fuse.aliyun-alinas-efc
 install -p -m 755 %{_builddir}/%{name}/src/alinas/watchdog/__init__.py %{buildroot}/usr/bin/aliyun-alinas-mount-watchdog
+install -p -m 644 %{_builddir}/%{name}/src/alinas/efc_process.py %{buildroot}/opt/aliyun/alinas/efc_process.py
+install -p -m 644 %{_builddir}/%{name}/src/alinas/process_probe.py %{buildroot}/opt/aliyun/alinas/process_probe.py
 
 install -p -m 644 %{_builddir}/%{name}/dist/cpfs/cpfs-utils.conf %{buildroot}%{_sysconfdir}/aliyun/cpfs/cpfs-utils.conf
 install -p -m 444 %{_builddir}/%{name}/dist/alinas-utils.crt %{buildroot}%{_sysconfdir}/aliyun/cpfs/alinas-utils.crt
@@ -126,6 +130,12 @@ install -p -m 644 %{_builddir}/%{name}/dist/alinas/aliyun-alinas-efc-minimum-sup
 /opt/aliyun/cpfs/tools/switch_server
 /usr/bin/aliyun-cpfs-mount-watchdog
 /usr/bin/aliyun-alinas-mount-watchdog
+/opt/aliyun/alinas/efc_process.py
+/opt/aliyun/alinas/process_probe.py
+%exclude /opt/aliyun/alinas/efc_process.pyc
+%exclude /opt/aliyun/alinas/efc_process.pyo
+%exclude /opt/aliyun/alinas/process_probe.pyc
+%exclude /opt/aliyun/alinas/process_probe.pyo
 
 /var/log/aliyun
 
@@ -151,6 +161,7 @@ fi
 %preun
 %systemd_preun aliyun-cpfs-mount-watchdog.service
 %systemd_preun aliyun-alinas-mount-watchdog.service
+/usr/bin/env python3 /opt/aliyun/alinas/process_probe.py kill-exe /usr/local/nas-agent/nas-agent || true
 
 %postun
 %systemd_postun_with_restart aliyun-cpfs-mount-watchdog.service
@@ -163,8 +174,6 @@ if [ $1 -eq 1 ]; then
         ps -eww -o pid,cmd,args | grep aliyun-alinas-mount-watchdog | grep -v grep | awk '{print $1}' | xargs -I {} kill -9 {}
     fi
 fi
-
-ps -eww -o pid,cmd,args | grep /usr/local/nas-agent/nas-agent | grep -v grep | awk '{print $1}' | xargs -I {} kill -9 {}
 
 if [ $1 -eq 0 ]; then
     rm -rf /usr/local/nas-agent
@@ -188,14 +197,13 @@ if [ $1 -eq 0 ]; then
    /sbin/stop aliyun-cpfs-mount-watchdog &> /dev/null || true
    /sbin/stop aliyun-alinas-mount-watchdog &> /dev/null || true
 fi
+/usr/bin/env python3 /opt/aliyun/alinas/process_probe.py kill-exe /usr/local/nas-agent/nas-agent || true
 
 %postun
 if [ $1 -eq 1 ]; then
     /sbin/restart aliyun-cpfs-mount-watchdog &> /dev/null || true
     /sbin/restart aliyun-alinas-mount-watchdog &> /dev/null || true
 fi
-
-ps -eww -o pid,cmd,args | grep /usr/local/nas-agent/nas-agent | grep -v grep | awk '{print $1}' | xargs -I {} kill -9 {}
 
 if [ $1 -eq 0 ]; then
     rm -rf /usr/local/nas-agent

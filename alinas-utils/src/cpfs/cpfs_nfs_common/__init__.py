@@ -88,12 +88,14 @@ def fatal_error(user_message, log_message=None, exit_code=1, exception=None):
         raise exception.__class__(user_message)
     sys.exit(exit_code)
 
+
 def warning_info(user_message, log_message=None):
     if log_message is None:
         log_message = user_message
-    
+
     sys.stdout.write('%s\n%s' % (user_message, DEFAULT_LOG_MSG))
     logging.warning(log_message)
+
 
 STATE_FILE_DIR = '/var/run/cpfs'
 STATE_SIGN = 'sign'
@@ -167,15 +169,17 @@ def get_ips(ips, weights):
     return main_ip, backup_ip
 
 
-REVOLVE_DNS_RETRY = 5
+RESOLVE_DNS_RETRY = 5
+RESOLVE_DNS_CMD = 'dig -t TXT +short +tcp {0}'
+RESOLVE_DNS_CMD_ALTERNATIVE = 'host -t TXT {0}|grep \'^{0}\''
 
 
 def _resolve_cpfs_dns(dns):
     if not dns.endswith('.'):
         dns += '.'
-    for i in range(REVOLVE_DNS_RETRY):
+    cmd = RESOLVE_DNS_CMD.format(dns)
+    for i in range(RESOLVE_DNS_RETRY, 0, -1):
         try:
-            cmd = 'host -t TXT {0}|grep \'^{0}\''.format(dns)
             out = subprocess.check_output(cmd, shell=True).decode('utf-8')
             weight_ips = [line.split('"')[1] for line in out.strip().split('\n')]
             if len(weight_ips) < 2:
@@ -191,10 +195,13 @@ def _resolve_cpfs_dns(dns):
             return ips, weights
 
         except Exception as e:
-            if i == REVOLVE_DNS_RETRY - 1:
-                fatal_error('Failed to resolve domain: {0}: {1}'.format(dns, e))
-            else:
+            if i > 2:
+                logging.warning('Failed to resolve domain by dig: {0}: {1}, downgrade to host'.format(dns, e))
+                cmd = RESOLVE_DNS_CMD_ALTERNATIVE.format(dns)
+            if i > 1:
                 time.sleep(0.1)
+            else:
+                fatal_error('Failed to resolve domain: {0}: {1}'.format(dns, e))
 
 
 def resolve_cpfs_dns(dns):
@@ -292,17 +299,22 @@ def try_update_haproxy_config_line(line, server_type, old_server, new_server):
        server cpfs_primary {remote}:2049 maxconn 2048 check port 2049 inter 2s fall 8 rise 30 on-marked-up shutdown-backup-sessions
        server cpfs_backup  {backup}:2049 maxconn 2048 check port 2049 inter 2s fall 8 rise 30 backup
     """
-    old_server = '{}:2049'.format(old_server)
-    new_server = '{}:2049'.format(new_server)
     params = line.strip().split()
     if len(params) < 3:
         return line
     if params[0] != 'server' or params[1] != server_type:
         return line
-    if params[2] != old_server:
-        logging.warning('Update haproxy configuration: old_%s in config %s not equal to %s, still switch', server_type, params[2], old_server)
-    line = line.replace(params[2], new_server)
+    # Parse current address as host:port and preserve the original port.
+    parts = params[2].rsplit(':', 1)
+    if len(parts) != 2:
+        return line
+    current_host, current_port = parts
+    if current_host != old_server:
+        logging.warning('Update haproxy configuration: old_%s in config %s not equal to %s, still switch', server_type, current_host, old_server)
+    new_addr = '{}:{}'.format(new_server, current_port)
+    line = line.replace(params[2], new_addr)
     return line
+
 
 def get_haproxy_config_file_path(domain, state_file_dir=STATE_FILE_DIR):
     state = load_state_file(state_file_dir, domain)
@@ -310,6 +322,36 @@ def get_haproxy_config_file_path(domain, state_file_dir=STATE_FILE_DIR):
         return state['config_file']
     else:
         return os.path.join(STATE_FILE_DIR, 'haproxy-config.%s' % domain)
+
+
+def parse_haproxy_server_host(line, server_type):
+    """Extract the host part from 'server cpfs_primary {host}:{port} ...'."""
+    if server_type not in line:
+        return None
+    params = line.strip().split()
+    if len(params) < 3:
+        return None
+    parts = params[2].rsplit(':', 1)
+    if len(parts) != 2:
+        return None
+    return parts[0]
+
+
+def get_mount_port_from_haproxy_config(haproxy_config_file):
+    """Read mount port from haproxy config file."""
+    try:
+        with open(haproxy_config_file, 'r') as f:
+            for line in f:
+                if 'cpfs_primary' in line:
+                    params = line.strip().split()
+                    if len(params) >= 3:
+                        parts = params[2].rsplit(':', 1)
+                        if len(parts) == 2 and parts[1].isdigit():
+                            return int(parts[1])
+    except:
+        pass
+    fatal_error('Failed to get mount port from haproxy config: {}'.format(haproxy_config_file))
+
 
 def update_haproxy_config_file(local_dns, old_primary_server, old_backup_server, new_primary_server, new_backup_server, state_file_dir=STATE_FILE_DIR):
     config_data = ""
@@ -340,17 +382,6 @@ def update_haproxy_config_file(local_dns, old_primary_server, old_backup_server,
             # others are ignored to avoid hide the root cause
             pass
         raise
-
-
-def get_clientaddr(dns, ip):
-    sk = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    try:
-        sk.connect((ip, 2049))
-        return sk.getsockname()[0]
-    except IOError:
-        fatal_error('Connection to {0}({1}) failed, please check the network'.format(dns, ip))
-    finally:
-        sk.close()
 
 
 @contextmanager

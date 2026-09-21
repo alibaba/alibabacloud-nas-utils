@@ -8,7 +8,9 @@
 #
 
 import watchdog
+import process_probe
 import json
+import os
 import tempfile
 
 from mock import MagicMock
@@ -32,8 +34,22 @@ def setup_mocks(mocker, mounts, state_files, is_pid_running=True, ps_info=''):
     mocker.patch('watchdog.get_current_unas_mounts', return_value=mounts)
     mocker.patch('watchdog.get_files_with_prefix', return_value=state_files)
     mocker.patch('watchdog.is_pid_running', return_value=is_pid_running)
+    def get_stunnel_probe(state):
+        if not is_pid_running:
+            return watchdog.StunnelProbeResult(
+                watchdog.STUNNEL_DEAD, None, 'test dead')
+        if 'uuid' not in state or state['uuid'] in ps_info:
+            identity = process_probe.ProcessIdentity(
+                state['pid'], 'S', 456, 'stunnel', '/usr/bin/stunnel')
+            return watchdog.StunnelProbeResult(
+                watchdog.STUNNEL_RUNNING, identity, 'test running')
+        return watchdog.StunnelProbeResult(
+            watchdog.STUNNEL_DEAD, None, 'test dead')
+    mocker.patch(
+        'watchdog.probe_stunnel_process',
+        side_effect=get_stunnel_probe,
+    )
     mocker.patch('watchdog.mark_as_unmounted', return_value=state)
-    mocker.patch('os.popen', return_value=MagicMock(read=MagicMock(return_value=ps_info)))
     mocker.patch('time.time', return_value=TIME + GRACE_PERIOD + 1)
 
     clean_up_mock = mocker.patch('watchdog.clean_up_mount_state')
@@ -66,7 +82,7 @@ def test_no_state_files(mocker):
                                                state_files={})
     wd = _setup_watchdog_mock(mocker)
 
-    watchdog.check_nfs_mounts(wd, GRACE_PERIOD)
+    watchdog.check_nfs_mounts(None, wd, GRACE_PERIOD)
 
     clean_up_mock.assert_not_called()
     restart_proxy.assert_not_called()
@@ -79,7 +95,7 @@ def test_malformed_state_file(mocker, tmpdir):
     wd = _setup_watchdog_mock(mocker)
     clean_up_mock, restart_proxy = setup_mocks(mocker, mounts={}, state_files={'mnt': state_file})
 
-    watchdog.check_nfs_mounts(wd, GRACE_PERIOD, state_file_dir)
+    watchdog.check_nfs_mounts(None, wd, GRACE_PERIOD, state_file_dir)
 
     clean_up_mock.assert_not_called()
     restart_proxy.assert_not_called()
@@ -94,7 +110,7 @@ def test_no_mount_for_state_file(mocker, tmpdir):
     wd = _setup_watchdog_mock(mocker)
     clean_up_mock, restart_proxy = setup_mocks(mocker, mounts={}, state_files={'mnt': state_file})
 
-    watchdog.check_nfs_mounts(wd, GRACE_PERIOD, state_file_dir)
+    watchdog.check_nfs_mounts(None, wd, GRACE_PERIOD, state_file_dir)
 
     clean_up_mock.assert_not_called()
     restart_proxy.assert_not_called()
@@ -113,7 +129,7 @@ def test_no_mount_for_state_file_out_of_grace_period(mocker, tmpdir):
                                                state_files={'mnt': state_file},
                                                ps_info='')
 
-    watchdog.check_nfs_mounts(wd, GRACE_PERIOD, state_file_dir)
+    watchdog.check_nfs_mounts(None, wd, GRACE_PERIOD, state_file_dir)
 
     clean_up_mock.assert_called_once()
     restart_proxy.assert_not_called()
@@ -129,11 +145,34 @@ def test_no_mount_for_state_file_in_grace_period(mocker, tmpdir):
     wd = _setup_watchdog_mock(mocker)
     clean_up_mock, restart_proxy = setup_mocks(mocker, mounts={}, state_files={'mnt': state_file})
 
-    watchdog.check_nfs_mounts(wd, GRACE_PERIOD, state_file_dir)
+    watchdog.check_nfs_mounts(None, wd, GRACE_PERIOD, state_file_dir)
 
     clean_up_mock.assert_not_called()
     restart_proxy.assert_not_called()
     #wd.handle_events.assert_called_once()
+
+
+def test_expired_unmount_is_cancelled_when_mount_reappears(mocker, tmpdir):
+    state = dict(STATE)
+    state['unmount_time'] = TIME - GRACE_PERIOD
+    state_file_dir, state_file = create_state_file(tmpdir, state)
+    mounts = {
+        'mnt': watchdog.Mount(
+            '127.0.0.1', '/mnt', 'nfs4', '', '0', '0'),
+    }
+    wd = _setup_watchdog_mock(mocker)
+    clean_up_mock, restart_proxy = setup_mocks(
+        mocker, mounts=mounts, state_files={'mnt': state_file},
+        ps_info=UUID)
+
+    watchdog.check_nfs_mounts(
+        None, wd, GRACE_PERIOD, state_file_dir)
+
+    clean_up_mock.assert_not_called()
+    restart_proxy.assert_not_called()
+    with open(os.path.join(state_file_dir, state_file)) as stream:
+        current = json.load(stream)
+    assert 'unmount_time' not in current
 
 
 def test_tls_not_running(mocker, tmpdir):
@@ -147,11 +186,56 @@ def test_tls_not_running(mocker, tmpdir):
                                                is_pid_running=False,
                                                ps_info='') 
 
-    watchdog.check_nfs_mounts(wd, GRACE_PERIOD, state_file_dir)
+    watchdog.check_nfs_mounts(None, wd, GRACE_PERIOD, state_file_dir)
 
     clean_up_mock.assert_not_called()
     restart_proxy.assert_called_once()
     #wd.handle_events.assert_called_once()
+
+
+def test_tls_restart_is_cancelled_when_mount_disappears(mocker, tmpdir):
+    state = dict(STATE)
+    state_file_dir, state_file = create_state_file(tmpdir, state)
+    mount = watchdog.Mount(
+        '127.0.0.1', '/mnt', 'nfs4', '', '0', '0')
+    wd = _setup_watchdog_mock(mocker)
+    clean_up_mock, restart_proxy = setup_mocks(
+        mocker, mounts={'mnt': mount}, state_files={'mnt': state_file},
+        is_pid_running=False)
+    mocker.patch(
+        'watchdog.get_current_local_nfs_mounts',
+        side_effect=[{'mnt': mount}, {}])
+    mark_as_unmounted = mocker.patch('watchdog.mark_as_unmounted')
+
+    watchdog.check_nfs_mounts(
+        None, wd, GRACE_PERIOD, state_file_dir)
+
+    clean_up_mock.assert_not_called()
+    restart_proxy.assert_not_called()
+    mark_as_unmounted.assert_called_once()
+
+
+def test_unknown_stunnel_probe_does_not_restart_or_cleanup(mocker, tmpdir):
+    state = dict(STATE)
+    state_file_dir, state_file = create_state_file(tmpdir, state)
+    mount = watchdog.Mount(
+        '127.0.0.1', '/mnt', 'nfs4', '', '0', '0')
+    wd = _setup_watchdog_mock(mocker)
+    clean_up_mock, restart_proxy = setup_mocks(
+        mocker, mounts={'mnt': mount}, state_files={'mnt': state_file})
+    mocker.patch(
+        'watchdog.probe_stunnel_process',
+        return_value=watchdog.StunnelProbeResult(
+            watchdog.STUNNEL_UNKNOWN, None, 'procfs unavailable'))
+    mark_as_unmounted = mocker.patch('watchdog.mark_as_unmounted')
+
+    watchdog.check_nfs_mounts(
+        None, wd, GRACE_PERIOD, state_file_dir)
+
+    clean_up_mock.assert_not_called()
+    restart_proxy.assert_not_called()
+    mark_as_unmounted.assert_not_called()
+
 
 def test_tls_not_running_when_pid_exist(mocker, tmpdir):
     state = dict(STATE)
@@ -164,7 +248,7 @@ def test_tls_not_running_when_pid_exist(mocker, tmpdir):
                                                is_pid_running=True,
                                                ps_info='')
 
-    watchdog.check_nfs_mounts(wd, GRACE_PERIOD, state_file_dir)
+    watchdog.check_nfs_mounts(None, wd, GRACE_PERIOD, state_file_dir)
 
     clean_up_mock.assert_not_called()
     restart_proxy.assert_called_once()
@@ -181,10 +265,13 @@ def test_tls_not_running_with_old_version_state(mocker, tmpdir):
                                                is_pid_running=True,
                                                ps_info='')
 
-    watchdog.check_nfs_mounts(wd, GRACE_PERIOD, state_file_dir)
+    watchdog.check_nfs_mounts(None, wd, GRACE_PERIOD, state_file_dir)
 
     clean_up_mock.assert_not_called()
     restart_proxy.assert_not_called()
+    with open(os.path.join(state_file_dir, state_file)) as stream:
+        upgraded_state = json.load(stream)
+    assert upgraded_state[watchdog.PROCESS_STARTTIME] == 456
 
 def test_extra_mount(mocker, tmpdir):
     state = dict(STATE)
@@ -198,7 +285,7 @@ def test_extra_mount(mocker, tmpdir):
                                                },
                                                state_files={'mnt3': state_file})
 
-    watchdog.check_nfs_mounts(wd, GRACE_PERIOD, state_file_dir)
+    watchdog.check_nfs_mounts(None, wd, GRACE_PERIOD, state_file_dir)
 
     clean_up_mock.assert_not_called()
     restart_proxy.assert_not_called()
@@ -232,7 +319,6 @@ def test_mixed_scenarios_normal_restart_cleanup(mocker, tmpdir):
     mounts = {
         'mnt1': watchdog.Mount('127.0.0.1', '/mnt1', 'nfs4', '', '0', '0'),
         'mnt2': watchdog.Mount('127.0.0.2', '/mnt2', 'nfs4', '', '0', '0'),
-        'mnt3': watchdog.Mount('127.0.0.3', '/mnt3', 'nfs4', '', '0', '0'),
     }
     
     # ps info: only state1 and state3 processes are running
@@ -244,7 +330,7 @@ def test_mixed_scenarios_normal_restart_cleanup(mocker, tmpdir):
                                                state_files=state_files,
                                                ps_info='stunnel-test-uuid-123\n9012 stunnel-test-uuid-789')
 
-    watchdog.check_nfs_mounts(wd, GRACE_PERIOD, state1_file_dir)
+    watchdog.check_nfs_mounts(None, wd, GRACE_PERIOD, state1_file_dir)
 
     # Verify:
     # 1. state3 triggers cleanup (grace period expired)
@@ -255,7 +341,11 @@ def test_mixed_scenarios_normal_restart_cleanup(mocker, tmpdir):
         state3_file,
         state3['pid'],
         True,
-        None
+        None,
+        state=mocker.ANY,
+        process_identity=process_probe.ProcessIdentity(
+            state3['pid'], 'S', 456, 'stunnel', '/usr/bin/stunnel'),
+        state_loader=wd.load_state_file,
     )    
 
     state2.pop(watchdog.STATE_SIGN, '')
@@ -265,4 +355,3 @@ def test_mixed_scenarios_normal_restart_cleanup(mocker, tmpdir):
         state2_file_dir,
         state2_file
     )
-

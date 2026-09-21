@@ -18,7 +18,9 @@ from contextlib import contextmanager
 from multiprocessing import Process, Event
 from mock import MagicMock, patch
 from mock_open import MockOpen
+import pytest
 import watchdog
+import efc_process
 from watchdog import _cleanup_unmounted_logs_by_size, TOTAL_UNMOUNTED_LOG_MAX_SIZE
 
 FILE_PREFIX = 'eac-'
@@ -37,10 +39,29 @@ def _mock_popen(mocker, returncode=0):
     return mocker.patch('subprocess.Popen', return_value=popen_mock)
 
 
+def _efc_probe(state, pid=123, proc_state='S'):
+    return efc_process.EfcProbeResult(
+        state=state,
+        owner_pid=pid,
+        proc_state=proc_state,
+        proc_starttime=456 if pid else 0,
+        proc_comm='aliyun-alinas-e' if pid else '',
+        lock_path='/var/run/efc/mount_uuid_test.efc.lock',
+        lock_dev=1 if pid else 0,
+        lock_inode=2 if pid else 0,
+        pidfile_pid=pid,
+        pidfile_match=bool(pid),
+        reason='test',
+    )
+
+
 def setup_mocks(mocker):
     fm = watchdog.StateFileManager()
     #mocker.patch('watchdog.write_unas_state_file')
-    mocker.patch('watchdog.is_unas_running', return_value=True)
+    mocker.patch(
+        'watchdog.efc_process.probe_efc',
+        return_value=_efc_probe(efc_process.EFC_RUNNING),
+    )
     clean_up = mocker.patch('watchdog.schedule_clean_up_mount_files')
     restart_unas = mocker.patch('watchdog.restart_unas_process')
     mocker.patch('watchdog.check_unas_sessmgr')
@@ -107,33 +128,9 @@ def create_state_file(tmpdir, state):
     return state_file.dirname, state_file.basename
 
 
-def test_is_unas_running(mocker):
-    # process is still alive
-    unas_state = watchdog.UnasState('mount_uuid_test', '/mnt', 'mount_path_test', 'mount_cmd_test', 'mount_key_test', 'bind_tag_test', False)
-    proc_mounts_info = {'dns_test':watchdog.Mount('server', '/mnt', 'eac', '', '', '')}
-    ps_mount_info = 'eac...mount_uuid=mount_uuid_test'
-    assert watchdog.is_unas_running(unas_state,  ps_mount_info) == True
-
-    # process dead, hot upgrade
-    ps_mount_info = 'eac...mount_uuid=mount_uuid_test '
-    m = {'/mnt' : watchdog.Mount('uuid1:mount_path_test:/', '/mnt', 'type', 'option', '', '')}
-    mocker.patch('watchdog.get_current_unas_mounts', return_value=m)
-    assert watchdog.is_unas_running(unas_state,  ps_mount_info) == True
-    # trick test
-    ps_mount_info = 'eac...mountpoint=/mnt'
-    m = {'/mnt' : watchdog.Mount('mount_uuid_test:mount_path_test:/', '/mnt', 'type', 'option', '', '')}
-    mocker.patch('watchdog.get_current_unas_mounts', return_value=m)
-    assert watchdog.is_unas_running(unas_state,  ps_mount_info) == False
-
-    # process dead, not hot upgrade
-    ps_mount_info = 'eac...mountpoint=/mnt '
-    m = {'/mnt' : watchdog.Mount('mount_uuid_test1:mount_path_test1:/', '/mnt', 'type', 'option', '', '')}
-    mocker.patch('watchdog.get_current_unas_mounts', return_value=m)
-    assert watchdog.is_unas_running(unas_state, ps_mount_info) == False
-
 def test_check_unas_mem(mocker):
     unas_state = watchdog.UnasState('mount_uuid_test', '/mnt', 'mount_path_test', 'mount_cmd_test', 'mount_key_test', 'bind_tag_test', True)
-    m = _mock_os_popen(mocker, "123")
+    probe = _efc_probe(efc_process.EFC_RUNNING)
     # mem usage not exceed
     anno_rss = watchdog.CGROUP_BASE_MEMORY_LIMIT_SIZE - watchdog.PAGE_SIZE
     shm = watchdog.CGROUP_BASE_MEMORY_LIMIT_SIZE + watchdog.PAGE_SIZE * 1024
@@ -143,12 +140,12 @@ def test_check_unas_mem(mocker):
     mp["/proc/123/statm"].read_data = mock_proc_statm
     with patch(BUILTIN_OPEN_FUNC, mp) as mock_file:
         mock_kill = mocker.patch('watchdog.kill_process_uuid')
-        watchdog.check_unas_process_mem(unas_state)
+        watchdog.check_unas_process_mem(unas_state, probe)
         mock_kill.assert_not_called()
 
 def test_check_unas_mem2(mocker):
     unas_state = watchdog.UnasState('mount_uuid_test', '/mnt', 'mount_path_test', 'mount_cmd_test', 'mount_key_test', 'bind_tag_test', False)
-    m = _mock_os_popen(mocker, "123")
+    probe = _efc_probe(efc_process.EFC_RUNNING)
     # mem usage exceed
     anno_rss = watchdog.CGROUP_BASE_MEMORY_LIMIT_SIZE + watchdog.PAGE_SIZE # exceed
     shm = watchdog.CGROUP_BASE_MEMORY_LIMIT_SIZE + watchdog.PAGE_SIZE * 1024
@@ -158,7 +155,7 @@ def test_check_unas_mem2(mocker):
     mp["/proc/123/statm"].read_data = mock_proc_statm
     with patch(BUILTIN_OPEN_FUNC, mp) as mock_file:
         mock_kill = mocker.patch('watchdog.kill_process_uuid')
-        watchdog.check_unas_process_mem(unas_state)
+        watchdog.check_unas_process_mem(unas_state, probe)
         mock_kill.assert_called_once()
 
 '''
@@ -186,24 +183,29 @@ def test_write_unas_state_file(mocker):
 '''
 
 def test_restart_unas_process(mocker, tmpdir):
-    pmock = _mock_popen(mocker, 0)
-    #mocker.patch('watchdog.write_unas_state_file')
-    mocker.patch('watchdog.lock_state_file')
+    dead = _efc_probe(efc_process.EFC_DEAD, pid=0)
+    running = _efc_probe(efc_process.EFC_RUNNING)
+    mocker.patch(
+        'watchdog.efc_process.probe_efc', side_effect=[dead, running])
     mocker.patch('watchdog.add_cgroup_limit')
+    mocker.patch('watchdog.get_current_unas_mounts', return_value=[
+        watchdog.Mount('mount_uuid_test:server:/', 'mount_point_test',
+                       'fuse.aliyun-alinas-efc', '', '0', '0')])
+    runner = mocker.Mock(return_value=(0, '', ''))
 
     mount_uuid = 'mount_uuid_test'
     mount_point = 'mount_point_test'
-    mount_path = 'mount_path_test'
+    mount_path = 'server:/'
     mount_cmd = 'mount_cmd_test'
     mount_key = 'mount_key_test'
     bind_tag = 'bind_tag_test'
     state_file_dir, state_file = create_state_file(tmpdir, {})
     assert os.path.exists(state_file_dir + '/' + state_file) == True
     unas_state = watchdog.UnasState(mount_uuid, mount_point, mount_path, mount_cmd, mount_key, bind_tag, True)
-    watchdog.restart_unas_process(unas_state, str(tmpdir))
-    args, _ = pmock.call_args
-    assert len(args) == 1
-    assert args[0].startswith(mount_cmd)
+    assert watchdog.restart_unas_process(
+        unas_state, str(tmpdir), expected_probe=dead, runner=runner) is True
+    runner.assert_called_once_with(
+        mount_cmd, watchdog.UNAS_RESTART_TIMEOUT)
     assert os.path.exists(state_file_dir + '/' + state_file) == True
 
 
@@ -298,7 +300,12 @@ def test_drop_unas_mount(mocker, tmpdir):
 def test_drop_unas_mount1(mocker, tmpdir):
     wd = _setup_watchdog_mock(mocker)
     mount_uuid = 'mount_uuid_test'
-    unas_state = {'mountuuid':mount_uuid, 'mountpoint':'/mnt', 'mountpath':'dns'}
+    unas_state = {
+        'mountuuid': mount_uuid,
+        'mountpoint': '/mnt',
+        'mountpath': 'dns',
+        'mountcmd': '',
+    }
     unas_mount_info = 'mount_uuid=%s' % mount_uuid
     fd = os.popen(unas_mount_info)
 
@@ -316,8 +323,73 @@ def test_drop_unas_mount1(mocker, tmpdir):
 
     watchdog.drop_unas_mount(unas_state, wd, tmpdir, 'eac-mountuuid')
 
-    mock3.assert_called_once()
-    mock7.assert_called_once
+    assert mock3.call_count == 2
+    mock7.assert_called_once()
+
+
+def test_drop_unas_mount_cancels_kill_when_mount_reappears(mocker, tmpdir):
+    wd = _setup_watchdog_mock(mocker)
+    state = {
+        'mountuuid': 'mount_uuid_test',
+        'mountpoint': '/mnt',
+        'mountpath': 'dns',
+        'mountcmd': '',
+        'fail_check_time': 1,
+    }
+    mount = watchdog.Mount(
+        'mount_uuid_test:dns', '/mnt', 'eac', '', '0', '0')
+    mocker.patch('watchdog.get_current_unas_mounts', return_value=[mount])
+    rewrite = mocker.patch('watchdog.rewrite_state_file')
+    kill = mocker.patch('watchdog.kill_process_uuid')
+
+    assert watchdog.drop_unas_mount(
+        state, wd, str(tmpdir), 'eac-mountuuid') is False
+
+    kill.assert_not_called()
+    rewrite.assert_called_once()
+    assert 'fail_check_time' not in state
+
+
+def test_drop_unas_mount_rechecks_immediately_before_kill(mocker, tmpdir):
+    wd = _setup_watchdog_mock(mocker)
+    state = {
+        'mountuuid': 'mount_uuid_test',
+        'mountpoint': '/mnt',
+        'mountpath': 'dns',
+        'mountcmd': '',
+        'fail_check_time': 1,
+    }
+    mount = watchdog.Mount(
+        'mount_uuid_test:dns', '/mnt', 'eac', '', '0', '0')
+    mocker.patch(
+        'watchdog.get_current_unas_mounts', side_effect=[[], [mount]])
+    kill = mocker.patch('watchdog.kill_process_uuid')
+    mocker.patch('watchdog.rewrite_state_file')
+
+    assert watchdog.drop_unas_mount(
+        state, wd, str(tmpdir), 'eac-mountuuid') is False
+
+    kill.assert_not_called()
+
+
+def test_clean_bindroot_rechecks_mounts_after_umount(mocker):
+    order = []
+
+    def sync_umount(*args):
+        order.append('umount')
+        return True
+
+    def current_mounts(*args):
+        order.append('mounts')
+        return []
+
+    mocker.patch('watchdog.sync_umount_unas', side_effect=sync_umount)
+    mocker.patch('watchdog.get_current_unas_mounts', side_effect=current_mounts)
+    mocker.patch('watchdog.os.path.exists', return_value=False)
+
+    assert watchdog.clean_bindroot(
+        'bindroot-uuid', watchdog.BIND_ROOT_DIR + '/bindroot-uuid', {}) is True
+    assert order == ['umount', 'mounts']
 
 
 def test_check_unas_mounts_no_statefiles(mocker, tmpdir):
@@ -356,10 +428,56 @@ def test_check_unas_mounts_invalid(mocker, tmpdir):
     mocker.patch('watchdog.get_files_with_prefix', return_value=state_files)
     # check unas failed
     mocker.patch('watchdog.is_unas_mounted', return_value=True)
-    mocker.patch('watchdog.is_unas_running', return_value=False)
+    mocker.patch(
+        'watchdog.efc_process.probe_efc',
+        return_value=_efc_probe(efc_process.EFC_DEAD, pid=0),
+    )
     watchdog.check_unas_mounts(wd, str(state_file_dir))
     restart_unas.assert_called_once()
     clean_up.assert_called_once()
+
+
+@pytest.mark.parametrize(
+    'probe_state,detach_result,should_restart',
+    [
+        (efc_process.EFC_ZOMBIE_LOCKED, efc_process.DETACH_WAIT, False),
+        (efc_process.EFC_ZOMBIE_LOCKED, efc_process.DETACH_DETACHED, True),
+        (efc_process.EFC_LOCK_CONFLICT, None, False),
+        (efc_process.EFC_UNKNOWN, None, False),
+    ],
+)
+def test_check_unas_mounts_state_action(
+        mocker, tmpdir, probe_state, detach_result, should_restart):
+    restart_unas, _ = setup_mocks(mocker)
+    wd = _setup_watchdog_mock(mocker)
+    state_file_dir, state_file = create_state_file(tmpdir, {})
+    mocker.patch(
+        'watchdog.get_files_with_prefix',
+        return_value={'/mnt': state_file},
+    )
+    mocker.patch(
+        'watchdog.get_current_unas_mounts',
+        return_value=[watchdog.Mount(
+            'mount_uuid_test:mount_path_test', '/mnt', 'eac', '', '0', '0')],
+    )
+    mocker.patch('watchdog.is_unas_mounted', return_value=True)
+    probe = _efc_probe(
+        probe_state,
+        proc_state='Z' if probe_state == efc_process.EFC_ZOMBIE_LOCKED else 'S',
+    )
+    mocker.patch('watchdog.efc_process.probe_efc', return_value=probe)
+    detach = mocker.patch(
+        'watchdog.try_remove_efc_lock_when_zombie',
+        return_value=detach_result,
+    )
+
+    watchdog.check_unas_mounts(wd, str(state_file_dir))
+
+    if probe_state == efc_process.EFC_ZOMBIE_LOCKED:
+        detach.assert_called_once_with('mount_uuid_test', probe)
+    else:
+        detach.assert_not_called()
+    assert restart_unas.called is should_restart
 
 
 def mock_load_state_file_no_fail(state_file_dir, state_file):
@@ -387,6 +505,109 @@ def test_check_unas_mounts_not_mounted(mocker, tmpdir):
     watchdog.check_unas_mounts(wd, str(state_file_dir))
     dmock.assert_called_once()
 
+
+def test_check_unas_mounts_reads_mounts_inside_uuid_lock(mocker, tmpdir):
+    restart_unas, _ = setup_mocks(mocker)
+    wd = _setup_watchdog_mock(mocker)
+    state_file_dir, state_file = create_state_file(tmpdir, {})
+    mocker.patch(
+        'watchdog.get_files_with_prefix', return_value={'st': state_file})
+    mocker.patch(
+        'watchdog.efc_process.probe_efc',
+        return_value=_efc_probe(efc_process.EFC_DEAD, pid=0))
+    mocker.patch('watchdog.rewrite_state_file')
+
+    lock_held = {'value': False}
+    mount_reads = []
+
+    @contextmanager
+    def tracked_lock(*args, **kwargs):
+        lock_held['value'] = True
+        try:
+            yield
+        finally:
+            lock_held['value'] = False
+
+    def current_mounts(*args, **kwargs):
+        mount_reads.append(lock_held['value'])
+        if not lock_held['value']:
+            return [watchdog.Mount(
+                'mount_uuid_test:mount_path_test', '/mnt',
+                'eac', '', '0', '0')]
+        return []
+
+    mocker.patch('watchdog.lock_state_file', side_effect=tracked_lock)
+    mocker.patch('watchdog.get_current_unas_mounts', side_effect=current_mounts)
+
+    watchdog.check_unas_mounts(wd, str(state_file_dir))
+
+    assert mount_reads == [False, True]
+    restart_unas.assert_not_called()
+
+
+def test_check_unas_mounts_uses_state_reloaded_under_lock(mocker):
+    initial = {
+        'mountuuid': 'uuid',
+        'mountpoint': '/old',
+        'mountpath': 'server:/old',
+        'mountcmd': 'old-command',
+        'mountkey': 'uuid.lock',
+    }
+    current = dict(initial)
+    current.update({
+        'mountpoint': '/new',
+        'mountpath': 'server:/new',
+        'mountcmd': 'new-command',
+    })
+    wd = MagicMock()
+    wd.load_state_file.side_effect = [initial, current]
+    mocker.patch('watchdog.lock_state_file')
+    mocker.patch(
+        'watchdog.get_files_with_prefix', return_value={'st': 'efc-uuid'})
+    mocker.patch(
+        'watchdog.get_current_unas_mounts',
+        return_value=[watchdog.Mount(
+            'uuid:server:/new', '/new', 'eac', '', '0', '0')])
+    dead = _efc_probe(efc_process.EFC_DEAD, pid=0)
+    mocker.patch('watchdog.efc_process.probe_efc', return_value=dead)
+    mocker.patch('watchdog.os.path.exists', return_value=False)
+    restart = mocker.patch('watchdog.restart_unas_process')
+    mocker.patch('watchdog.schedule_clean_up_mount_files')
+
+    watchdog.check_unas_mounts(wd, '/state')
+
+    restarted_state = restart.call_args[0][0]
+    assert restarted_state.mountpoint == '/new'
+    assert restarted_state.mountpath == 'server:/new'
+    assert restarted_state.mountcmd == 'new-command'
+
+
+def test_check_unas_mounts_skips_changed_state_identity(mocker):
+    initial = {
+        'mountuuid': 'uuid',
+        'mountpoint': '/mnt',
+        'mountpath': 'server:/',
+        'mountcmd': 'command',
+        'mountkey': 'uuid.lock',
+    }
+    changed = dict(initial)
+    changed['mountuuid'] = 'other-uuid'
+    wd = MagicMock()
+    wd.load_state_file.side_effect = [initial, changed]
+    mocker.patch('watchdog.lock_state_file')
+    mocker.patch(
+        'watchdog.get_files_with_prefix', return_value={'st': 'efc-uuid'})
+    mounts = mocker.patch('watchdog.get_current_unas_mounts')
+    probe = mocker.patch('watchdog.efc_process.probe_efc')
+    restart = mocker.patch('watchdog.restart_unas_process')
+    mocker.patch('watchdog.schedule_clean_up_mount_files')
+
+    watchdog.check_unas_mounts(wd, '/state')
+
+    mounts.assert_called_once_with(watchdog.MOUNT_TYPE_ALL)
+    probe.assert_not_called()
+    restart.assert_not_called()
+
 def test_check_unas_bindmount(mocker, tmpdir):
     restart_unas, clean_up = setup_mocks(mocker)
     wd = _setup_watchdog_mock(mocker)
@@ -394,7 +615,10 @@ def test_check_unas_bindmount(mocker, tmpdir):
     state_file_dir, state_file = create_state_file(tmpdir, state)
     state_files = {'/var/run/alinas/bindroot':state_file}
     mocker.patch('watchdog.get_files_with_prefix', return_value=state_files)
-    mocker.patch('watchdog.is_unas_running', return_value=False)
+    mocker.patch(
+        'watchdog.efc_process.probe_efc',
+        return_value=_efc_probe(efc_process.EFC_DEAD, pid=0),
+    )
     mocker.patch('watchdog.get_current_unas_mounts',
                 return_value=[watchdog.Mount('bindroot-xxoo:127.0.0.1:/', '/var/run/alinas/bindroot', 'aliyun-alinas-eac', '', '0', '0')])
     local_mount_dns = state['mountuuid'] + ':' + state['mountpath']
@@ -406,12 +630,18 @@ def test_check_unas_bindmount(mocker, tmpdir):
     restart_unas.assert_called_once()
 
     restart_unas.reset_mock()
-    mocker.patch('watchdog.is_unas_running', return_value=True)
+    mocker.patch(
+        'watchdog.efc_process.probe_efc',
+        return_value=_efc_probe(efc_process.EFC_RUNNING),
+    )
     watchdog.check_unas_mounts(wd, str(state_file_dir))
     restart_unas.assert_not_called()
 
     restart_unas.reset_mock()
-    mocker.patch('watchdog.is_unas_running', return_value=True)
+    mocker.patch(
+        'watchdog.efc_process.probe_efc',
+        return_value=_efc_probe(efc_process.EFC_RUNNING),
+    )
     mocker.patch('watchdog.get_current_unas_mounts',
         return_value=[watchdog.Mount('bindroot-xxoo:127.0.0.1:/', '/var/run/alinas/bindroot', 'aliyun-alinas-eac', '', '0', '0'), watchdog.Mount('bindroot-xxoo:127.0.0.1:/', '/mnt', 'aliyun-alinas-eac', '', '0', '0')])
     mounted = watchdog.is_unas_bindroot_mounted(state, watchdog.get_current_unas_mounts())
@@ -428,7 +658,10 @@ def test_check_unas_bindmount(mocker, tmpdir):
     mocker.patch('watchdog.get_files_with_prefix', return_value=state_files)
     mocker.patch('watchdog.get_current_unas_mounts', \
         return_value=[watchdog.Mount('bindroot-xxoo:127.0.0.1:/', '/var/run/alinas/bindroot', 'aliyun-alinas-eac', '', '0', '0')])
-    mocker.patch('watchdog.is_unas_running', return_value=True)
+    mocker.patch(
+        'watchdog.efc_process.probe_efc',
+        return_value=_efc_probe(efc_process.EFC_RUNNING),
+    )
     try_umount_unas = mocker.patch('watchdog.try_umount_unas', watchdog.try_umount_unas)
     clean_shm_files = mocker.patch('watchdog.clean_shm_files', watchdog.clean_shm_files)
     clean_up_unas_state = mocker.patch('watchdog.clean_up_unas_state', watchdog.clean_up_unas_state)
@@ -534,4 +767,3 @@ class TestCleanupBySize:
         path_new = os.path.join(log_dir, 'efc-unmounted-2', 'vsclog', 'new.log')
         assert os.path.exists(path_old)
         assert os.path.exists(path_new)
-

@@ -24,6 +24,7 @@ from datetime import datetime
 from mock import MagicMock, patch
 
 import watchdog
+import efc_process
 from watchdog import SafeConfig, EnvMonitor, NAS_AGENT_CONFIG_SECTION
 
 
@@ -134,6 +135,10 @@ class TestMocker:
         self._mkdir_mocker = patch('os.makedirs', side_effect=self._mkdir_side_effect)
         self._mknod = os.mknod
         self._mknod_mocker = patch('os.mknod', side_effect=self._monod_side_effect)
+        self._efc_probe_mocker = patch(
+            'watchdog.efc_process.probe_efc',
+            side_effect=self._efc_probe_side_effect,
+        )
 
         self._region = region
         self._mounts = []
@@ -262,6 +267,36 @@ class TestMocker:
             return
         print('monod', path)
 
+    def _efc_probe_side_effect(self, mount_uuid, *args, **kwargs):
+        for mount in self._mounts:
+            if mount.uuid == mount_uuid:
+                return efc_process.EfcProbeResult(
+                    state=efc_process.EFC_RUNNING,
+                    owner_pid=mount.pid,
+                    proc_state='S',
+                    proc_starttime=1,
+                    proc_comm='aliyun-alinas-e',
+                    lock_path='/var/run/efc/%s.efc.lock' % mount_uuid,
+                    lock_dev=1,
+                    lock_inode=1,
+                    pidfile_pid=mount.pid,
+                    pidfile_match=True,
+                    reason='test',
+                )
+        return efc_process.EfcProbeResult(
+            state=efc_process.EFC_DEAD,
+            owner_pid=0,
+            proc_state='',
+            proc_starttime=0,
+            proc_comm='',
+            lock_path='/var/run/efc/%s.efc.lock' % mount_uuid,
+            lock_dev=0,
+            lock_inode=0,
+            pidfile_pid=0,
+            pidfile_match=False,
+            reason='test',
+        )
+
     @property
     def logs(self):
         return self._logger._logs
@@ -275,6 +310,7 @@ class TestMocker:
         self._proc_popen_mocker.start()
         self._mkdir_mocker.start()
         self._mknod_mocker.start()
+        self._efc_probe_mocker.start()
         return self
 
     def __exit__(self, type, value, trace):
@@ -285,6 +321,7 @@ class TestMocker:
         self._proc_popen_mocker.stop()
         self._mkdir_mocker.stop()
         self._mknod_mocker.stop()
+        self._efc_probe_mocker.stop()
 
     def add_mount(self, mount):
         self._mounts.append(mount)

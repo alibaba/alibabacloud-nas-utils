@@ -42,6 +42,16 @@ from signal import SIGHUP, SIGTERM
 from contextlib import contextmanager
 
 try:
+    import efc_process
+    import process_probe
+except ImportError:
+    ALINAS_PYTHON_DIR = '/opt/aliyun/alinas'
+    if ALINAS_PYTHON_DIR not in sys.path:
+        sys.path.insert(0, ALINAS_PYTHON_DIR)
+    import efc_process
+    import process_probe
+
+try:
     from configparser import ConfigParser, NoOptionError, NoSectionError
 except ImportError:
     import ConfigParser
@@ -187,14 +197,16 @@ TOTAL_UNMOUNTED_LOG_MAX_SIZE = 1 * 1024 * 1024 * 1024  # 1 GB
 MONITOR_FILE_GC_IN_SEC = 3600 # default 1 hour
 EAC_SOCKET_SUFFIX = 'eac.sock'
 EFC_SOCKET_SUFFIX = 'efc.sock'
-EFC_LOCK_SUFFIX = 'efc.lock'
-EFC_PID_SUFFIX = 'efc.pid'
 
 UNAS_LOCK_STATEFILE_TIMEOUT = 20
 UNAS_MOUNT_FAIL_MAX_CHECK_TIME = 60
 UNAS_UMOUNT_FAIL_TIMEOUT = 180
 UNAS_UMOUNT_KILL_PROCESS_MIN_ALIVE = 60
 UNAS_ZOMBIE_PROCESS_TIMEOUT = 60
+UNAS_RESTART_TIMEOUT = 180
+UNAS_RESTART_RETRY_INTERVAL = 5
+# Logging only: do not change the retry interval or process-state decisions.
+UNAS_RESTART_UNCONFIRMED_ERROR_THRESHOLD = 3
 BIND_ROOT_PREFIX = 'bindroot-'
 BIND_ROOT_DIR = STATE_FILE_DIR + '/bindroot'
 
@@ -232,7 +244,7 @@ NAS_AGENT_CLIENT_TYPE_NFS_V4 = 'nfs4'
 NAS_AGENT_CLIENT_TYPE_ALL = 'all'
 
 Mount = namedtuple('Mount', ['server', 'mountpoint', 'type', 'options', 'freq', 'passno'])
-MountEntity = namedtuple('MountEntity', ['clienttype', 'pid', 'mountuuid', 'connid', 'fsid', 'fstype', 'region', 'state', 'entries'])
+MountEntity = namedtuple('MountEntity', ['clienttype', 'pid', 'mountuuid', 'connid', 'fsid', 'nodeid', 'fstype', 'region', 'state', 'entries'])
 UnasState = namedtuple('UnasState', ['mountuuid', 'mountpoint', 'mountpath', 'mountcmd', 'mountkey', BIND_TAG, SESSMGR_REQUIRED])
 
 POD_UID_PATTERN = re.compile('^[0-9a-z]{8}-[0-9a-z]{4}-[0-9a-z]{4}-[0-9a-z]{4}-[0-9a-z]{12}$')
@@ -269,10 +281,15 @@ PEXPORTER_LOG_CONF_TEMPLATE_PATH = '/etc/aliyun/alinas/log_conf.efc.pexporter.js
 MAIN_LOOP_TIME = 0
 MAIN_LOOP_HANG_ABORT_THRES = 600  # seconds
 
-PS_CMD = 'ps -eww -o pid,cmd,args '
-#    PID CMD                         COMMAND
-#  14190 /usr/bin/aliyun-alinas-efc- /usr/bin/aliyun-alinas-efc-sessmgrd --apsara_log_conf_path=/var/log/aliyun/alinas/log_conf.sessmgr.json
-#  24309 /usr/bin/aliyun-alinas-efc  /usr/bin/aliyun-alinas-efc -o server=9ff4d4bbb1-tfj1.cn-zhangjiakou.nas.aliyuncs.com:/ -o mountpoint=/mnt/myc -o rw,protocol=efc,fstype=nas,net=tcp,fd_store=sessmgrd,client_owner=nas-test011122132022.ea134_a9voK4bB_1734320510421840,default_permissions,allow_other --unas_CoreFileSizeLimitSize=-1 -o mount_uuid=a9voK4bB --apsara_log_conf_path=/var/log/aliyun/alinas/efc-a9voK4bB/log_conf.efc.json
+PROCESS_STARTTIME = 'pid_starttime'
+STUNNEL_RUNNING = 'RUNNING'
+STUNNEL_DEAD = 'DEAD'
+STUNNEL_UNKNOWN = 'UNKNOWN'
+StunnelProbeResult = namedtuple(
+    'StunnelProbeResult', ['state', 'identity', 'reason'])
+STUNNEL_UNKNOWN_LOG_INTERVAL_SEC = 60
+# Diagnostics only: never use these records to decide whether to act.
+_stunnel_unknown_reports = {}
 
 def fatal_error(user_message, log_message=None):
     if log_message is None:
@@ -655,6 +672,149 @@ def is_pid_running(pid):
     except OSError:
         return False
 
+
+def _stunnel_exe_paths(state):
+    command = state.get('cmd', [])
+    if isinstance(command, str):
+        command = command.split()
+    if not command:
+        return ()
+
+    executable = command[0]
+    if not os.path.basename(executable).startswith('stunnel'):
+        return ()
+    if os.path.isabs(executable):
+        return (executable,)
+    resolved = shutil.which(executable)
+    return (resolved,) if resolved else ()
+
+
+def probe_stunnel_process(state, proc_root='/proc'):
+    try:
+        pid = int(state.get('pid', 0))
+        if pid <= 1:
+            return StunnelProbeResult(STUNNEL_DEAD, None, 'invalid pid')
+        identity = process_probe.read_process_identity(pid, proc_root)
+        if identity.state == 'Z':
+            return StunnelProbeResult(STUNNEL_DEAD, identity, 'zombie')
+
+        expected_starttime = state.get(PROCESS_STARTTIME)
+        if (expected_starttime is not None
+                and int(expected_starttime) != identity.starttime):
+            return StunnelProbeResult(
+                STUNNEL_DEAD, identity, 'pid starttime changed')
+
+        accepted = process_probe.expected_exe_paths(_stunnel_exe_paths(state))
+        if accepted and identity.exe in accepted:
+            return StunnelProbeResult(
+                STUNNEL_RUNNING, identity, 'pid and executable match')
+
+        # Package upgrades can replace a stunnel symlink while the old inode
+        # keeps running. Older state files can also lack executable identity
+        # fields. In both cases, the known PID is accepted only when its live
+        # executable is still a stunnel binary; starttime pins it afterwards.
+        if os.path.basename(identity.exe).startswith('stunnel'):
+            return StunnelProbeResult(
+                STUNNEL_RUNNING, identity, 'stunnel executable basename match')
+        return StunnelProbeResult(
+            STUNNEL_DEAD, identity, 'pid executable is not stunnel')
+    except (IOError, OSError) as error:
+        if error.errno in (errno.ENOENT, errno.ESRCH):
+            return StunnelProbeResult(
+                STUNNEL_DEAD, None, 'process no longer exists')
+        return StunnelProbeResult(
+            STUNNEL_UNKNOWN, None, 'procfs read failed: %s' % error)
+    except (TypeError, ValueError) as error:
+        return StunnelProbeResult(
+            STUNNEL_UNKNOWN, None, 'invalid process identity: %s' % error)
+
+
+def _report_stunnel_unknown(state_file_dir, state_file, state, reason):
+    now = time.monotonic()
+    key = (state_file_dir, state_file)
+    identity = (state.get('pid'), state.get(PROCESS_STARTTIME))
+    report = _stunnel_unknown_reports.get(key)
+    if report is None or report['identity'] != identity:
+        report = {'identity': identity, 'first_seen': now,
+                  'last_log': None, 'count': 0}
+        _stunnel_unknown_reports[key] = report
+    report['seen_this_scan'] = True
+    report['count'] += 1
+    if (report['last_log'] is not None
+            and now - report['last_log'] < STUNNEL_UNKNOWN_LOG_INTERVAL_SEC):
+        return
+
+    duration = now - report['first_seen']
+    log = (logging.error if duration >= STUNNEL_UNKNOWN_LOG_INTERVAL_SEC
+           else logging.warning)
+    log('Defer proxy action because process state is UNKNOWN, '
+        'state_file:%s pid:%s pid_starttime:%s duration_sec:%.1f '
+        'count:%d reason:%s', os.path.join(state_file_dir, state_file),
+        identity[0], identity[1], duration, report['count'], reason)
+    report['last_log'] = now
+
+
+def get_stunnel_process_identity(state, proc_root='/proc'):
+    probe = probe_stunnel_process(state, proc_root)
+    return probe.identity if probe.state == STUNNEL_RUNNING else None
+
+
+def signal_stunnel_process_group_if_same(
+        state, sig, expected_identity=None, proc_root='/proc'):
+    """Signal verified stunnel and return its process group, or ``None``."""
+    try:
+        identity = get_stunnel_process_identity(state, proc_root)
+        if identity is None:
+            return None
+        if (expected_identity is not None
+                and not process_probe.same_process_identity(
+                    expected_identity, identity)):
+            return None
+
+        process_group = os.getpgid(identity.pid)
+        confirmed = get_stunnel_process_identity(state, proc_root)
+        if not process_probe.same_process_identity(identity, confirmed):
+            return None
+        os.killpg(process_group, sig)
+        return process_group
+    except OSError as error:
+        if error.errno in (errno.ENOENT, errno.ESRCH):
+            return None
+        raise
+
+
+def refresh_and_pin_stunnel_identity(
+        watchdog, state_file_dir, state_file, expected_identity):
+    """Reload legacy state before pinning its current stunnel identity."""
+    state = watchdog.load_state_file(state_file_dir, state_file)
+    if not state:
+        return None, None
+
+    probe = probe_stunnel_process(state)
+    if (probe.state != STUNNEL_RUNNING
+            or not process_probe.same_process_identity(
+                expected_identity, probe.identity)):
+        logging.info(
+            'Skip pinning stunnel identity because process or state changed, '
+            'state_file:%s', state_file)
+        return state, probe
+
+    if PROCESS_STARTTIME not in state:
+        # Online upgrades leave state files without starttime. Preserve the
+        # freshly reloaded state so this compatibility write cannot overwrite
+        # fields changed since the first watchdog snapshot.
+        state[PROCESS_STARTTIME] = probe.identity.starttime
+        rewrite_state_file(state, state_file_dir, state_file)
+    return state, probe
+
+
+def set_process_starttime(state, pid, proc_root='/proc'):
+    try:
+        identity = process_probe.read_process_identity(pid, proc_root)
+        state[PROCESS_STARTTIME] = identity.starttime
+    except (IOError, OSError, ValueError):
+        state.pop(PROCESS_STARTTIME, None)
+
 def start_proxy_preexec_fn():
     os.setsid()
     signal.signal(signal.SIGTERM, signal.SIG_DFL)
@@ -739,24 +899,71 @@ def is_deprecated_mount_state_dir(mount_state_dir):
     return match is not None
 
 # strong guarantee
-def clean_up_mount_state(state_file_dir, state_file, pid, is_running, mount_state_dir=None):
-    if is_running:
-        kill_proxy(pid)
+def clean_up_mount_state(state_file_dir, state_file, pid, is_running,
+                         mount_state_dir=None, state=None,
+                         process_identity=None, state_loader=None):
+    if state_loader is not None:
+        current_state = state_loader(state_file_dir, state_file)
+        if not current_state or current_state != state:
+            logging.info(
+                'Cancel proxy cleanup because state changed, state_file:%s',
+                state_file)
+            return False
+        state = current_state
+        current_probe = probe_stunnel_process(state)
+        if current_probe.state == STUNNEL_UNKNOWN:
+            _report_stunnel_unknown(
+                state_file_dir, state_file, state,
+                'cleanup check: %s' % current_probe.reason)
+            return False
+        process_identity = current_probe.identity
+        is_running = current_probe.state == STUNNEL_RUNNING
 
-    if is_pid_running(pid):
+    if is_running:
+        if state is not None:
+            process_group = signal_stunnel_process_group_if_same(
+                state, SIGTERM, process_identity)
+            if process_group is not None:
+                logging.info('Terminating running proxy - PID: %d, group ID: %s',
+                             pid, process_group)
+        else:
+            # Compatibility for callers which do not have the signed state.
+            kill_proxy(pid)
+
+    if state is not None:
+        final_probe = probe_stunnel_process(state)
+        if final_probe.state == STUNNEL_UNKNOWN:
+            _report_stunnel_unknown(
+                state_file_dir, state_file, state,
+                'cleanup recheck: %s' % final_probe.reason)
+            return False
+        still_running = final_probe.state == STUNNEL_RUNNING
+    else:
+        still_running = is_pid_running(pid)
+    if still_running:
         logging.info('Proxy: %d is still running, will retry termination', pid)
+        return False
     else:
         logging.info('Proxy: %d is no longer running, cleaning up state', pid)
         state_file_path = os.path.join(state_file_dir, state_file)
-        try:
-            with open(state_file_path) as f:
-                state = json.load(f)
-        except IOError as e:
-            if e.errno == errno.ENOENT:
-                # someone removes the state file, we can do nothing better than ignoring it
-                return
+        if state is None:
+            try:
+                with open(state_file_path) as f:
+                    state = json.load(f)
+            except IOError as e:
+                if e.errno == errno.ENOENT:
+                    # someone removes the state file, we can do nothing better than ignoring it
+                    return
 
-            raise
+                raise
+
+        if state_loader is not None:
+            current_state = state_loader(state_file_dir, state_file)
+            if not current_state or current_state != state:
+                logging.info(
+                    'Cancel proxy cleanup because state changed after signal, '
+                    'state_file:%s', state_file)
+                return False
 
         for f in state.get('files', list()):
             logging.debug('Deleting %s', f)
@@ -784,6 +991,7 @@ def clean_up_mount_state(state_file_dir, state_file, pid, is_running, mount_stat
                     "Attempt to remove mount state directory %s failed. Directory is not present.",
                     mount_state_dir_abs_path,
                 )
+        return True
 
 # strong guarantee
 def rewrite_state_file(state, state_file_dir, state_file):
@@ -817,8 +1025,23 @@ def mark_as_unmounted(state, state_file_dir, state_file, current_time):
 
 # strong guarantee
 def restart_proxy(child_procs, state, state_file_dir, state_file):
+    # A failed/transient first probe must not create a duplicate proxy.
+    current_probe = probe_stunnel_process(state)
+    if current_probe.state != STUNNEL_DEAD:
+        if current_probe.state == STUNNEL_UNKNOWN:
+            _report_stunnel_unknown(
+                state_file_dir, state_file, state,
+                'restart recheck: %s' % current_probe.reason)
+        else:
+            logging.info(
+                'Cancel proxy restart because stunnel is not confirmed dead, '
+                'state_file:%s state:%s reason:%s', state_file,
+                current_probe.state, current_probe.reason)
+        return False
+
     new_tunnel_pid = start_proxy(child_procs, state_file, state['cmd'])
     state['pid'] = new_tunnel_pid
+    set_process_starttime(state, new_tunnel_pid)
 
     try:
         logging.debug('Rewriting %s with new pid: %d', state_file, new_tunnel_pid)
@@ -831,6 +1054,8 @@ def restart_proxy(child_procs, state, state_file_dir, state_file):
             fatal_error('Failed to cleanup unused pid {0}'.format(new_tunnel_pid))
 
         raise
+
+    return True
 
 
 def sign_state(state):
@@ -933,12 +1158,12 @@ def sync_umount_unas(mount_point, umount_flag):
 
 def clean_bindroot(mount_uuid, mount_point, state):
     try:
-        unas_proc_mounts = get_current_unas_mounts(MOUNT_TYPE_ALL)
         if not mount_point.startswith(BIND_ROOT_DIR):
             logging.error('Fail to clean unas bindroot, mountpoint error, uuid:%s mount_point:%s' % (mount_uuid, mount_point))
             return False
         if sync_umount_unas(mount_point, NORMAL_UMOUNT):
             # double-check bindroot mount not alive
+            unas_proc_mounts = get_current_unas_mounts(MOUNT_TYPE_ALL)
             if is_unas_bindroot_mount_exist(mount_uuid, unas_proc_mounts):
                 logging.error('Fail to clean unas bindroot, uuid exists in mounts still, uuid:%s mount_point:%s' % (mount_uuid, mount_point))
                 return False
@@ -969,18 +1194,6 @@ def clean_up_unas_state(state_file_dir, state_file, state):
         if e.errno != errno.ENOENT:
             raise
 
-# return unas status normal
-def is_unas_running(unas_state, ps_mount_info):
-    mount_uuid = unas_state.mountuuid
-    regex_uuid = 'mount_uuid=%s' % mount_uuid 
-    # unas process is still alive
-    if ps_mount_info.find(regex_uuid) != -1:
-        return True
-         
-    # exited unmormally, need lift by watchdog
-    return False
-
-
 def parse_val_from_kvstr(kvstr, key, default_val):
     if key in kvstr:
         idx = kvstr.index(key)
@@ -1010,7 +1223,7 @@ def get_unas_file_open_max_size(mount_options):
         f.close()
     return file_max * UNAS_SHM_FILE_SIZE
 
-def add_cgroup_limit(mount_cmd, mount_uuid, cgroup_dir=CGROUP_DIR):
+def add_cgroup_limit(mount_cmd, mount_uuid, cgroup_dir=CGROUP_DIR, efc_pid=None):
     try:
         res = os.popen("cat /proc/mounts | grep cgroup | grep memory | tr ',' ' ' | awk '{print $4}'").read().strip()
         if res == 'ro':
@@ -1044,162 +1257,253 @@ def add_cgroup_limit(mount_cmd, mount_uuid, cgroup_dir=CGROUP_DIR):
         with open(oom_ctrl_path, 'w') as f:
             f.write('0')
 
-        # sort ps output by start time and reserve the latest one to avoid failure in upgrade
-        cmd = "ps -eww -o pid,start_time,cmd,args --sort=start_time | grep 'e[af]c' | grep mount_uuid=%s | grep -vw grep | awk '{print $1}'" % mount_uuid
-        pids = os.popen(cmd).read()
-        if pids.endswith('\n'):
-            pids = pids[:-1]
+        if efc_pid is None:
+            probe = efc_process.probe_efc(mount_uuid, EFC_WORKSPACE_DIR)
+            if probe.state == efc_process.EFC_RUNNING:
+                efc_pid = probe.owner_pid
 
-        pid = pids.split('\n')[-1]
+        if not efc_pid or efc_pid <= 1:
+            logging.warning(
+                'get EFC pid from lock owner failed, uuid %s, '
+                'skip adding pid to cgroup procs' % mount_uuid)
+            return
 
         with open(procs_path, 'a') as f:
-            f.write(pid)
+            f.write(str(efc_pid))
 
     except Exception as e:
         logging.warning('add cgroup memory limit failed, uuid %s, %s, failure ignored' % (mount_uuid, str(e)))
 
-def check_backend_enable_lease(server, protocol, net_type, flags):
-    cmd = '%s --cmdline_command=precheckconfig --cmdline_server=%s --cmdline_protocol=%s --cmdline_net_type=%s %s' % (CMDUTIL_BIN_PATH, server, protocol, net_type, flags)
-    errcode, stdmsg, errmsg = exec_cmd_in_subprocess(cmd)
-    if errcode != 0 and 'lease_enabled' not in stdmsg:
-        logging.warning('precheckconfig fail, will fallback to lease_Enable=false, cmd:%s, errcode:%s, stdmsg:%s, errmsg:%s' % (cmd, errcode, stdmsg, errmsg))
-        return False
-    logging.info("precheck_fs_config cmd:%s, stdmsg:%s" % (cmd, stdmsg))
-    if 'lease_enabled:true' in stdmsg:
-        return True
-    else:
-        return False
-
-#https://project.aone.alibaba-inc.com/v2/project/958130/bug/72055927
-def adjust_mount_cmd_before_restart(mount_cmd, mount_path):
-    try:
-        # match fstype
-        match = re.search(r'fstype=([^, ]+)', mount_cmd)
-        if match:
-            fstype = match.group(1)
-        else:
-            raise Exception('fstype not found in mount cmd')
-        if fstype != 'cpfs':
-            raise Exception('fstype is not cpfs')
-        # match lease_Enable flag
-        match = re.search(r'--lease_Enable=([^, ]+)', mount_cmd)
-        if match:
-            lease = match.group(1)
-        else:
-            raise Exception('lease_Enable not found in mount cmd')
-        if lease != 'true':
-            raise Exception('lease_Enable is not true')
-        # match net
-        match = re.search(r'net=([^, ]+)', mount_cmd)
-        if match:
-            net_type = match.group(1)
-        else:
-            raise Exception('net not found in mount cmd')
-        # match protocol
-        match = re.search(r'protocol=([^, ]+)', mount_cmd)
-        if match:
-            protocol = match.group(1)
-        else:
-            raise Exception('protocol not found in mount cmd')
-        # match precheck flags
-        flag_list = []
-        for flag in UNAS_PRECHECK_FS_FLAGS:
-            match = re.search(r'%s=([^, ]+)' % flag, mount_cmd)
-            if match:
-                flag_list.append("--" + flag + "=" + match.group(1))
-        flags = ' '.join(flag_list)
-        # precheck
-        if not check_backend_enable_lease(mount_path, protocol, net_type, flags):
-            mount_cmd = mount_cmd + " --watchdog_TurnOffLease=true "
-        else:
-            raise Exception("backend still support lease")
-    except Exception as e:
-        logging.info('remount use origin mount cmd, reason: %s', str(e))
-    return mount_cmd
-
-# 全局字典，记录僵尸进程首次检测到的时间
+# Record the first time a specific UUID/PID/starttime/inode combination was
+# observed as a zombie lock owner.
 zombie_detection_times = {}
+# Completion time of restart attempts not yet confirmed RUNNING. This is only
+# a retry guard; each scan must still probe the current owner and mount state.
+restart_attempt_times = {}
+# Diagnostic context for pending attempts, never evidence of process liveness.
+_restart_log_contexts = {}
+restart_in_progress = set()
+restart_guard = threading.Lock()
 
-def try_remove_efc_lock_when_zombie(mount_uuid):
-    pid_file = f"{EFC_WORKSPACE_DIR}/{mount_uuid}.{EFC_PID_SUFFIX}"
-    lock_file = f"{EFC_WORKSPACE_DIR}/{mount_uuid}.{EFC_LOCK_SUFFIX}"
+
+def _clear_unas_restart(mount_uuid):
+    restart_attempt_times.pop(mount_uuid, None)
+    return _restart_log_contexts.pop(mount_uuid, {})
+
+
+def _clear_zombie_detection(mount_uuid, keep_key=None):
+    for key in list(zombie_detection_times):
+        if key[0] == mount_uuid and key != keep_key:
+            del zombie_detection_times[key]
+
+
+def try_remove_efc_lock_when_zombie(mount_uuid, probe=None, now=None):
+    """Detach a persistently zombie-owned EFC lock after strict revalidation."""
     try:
-        if not os.path.exists(pid_file):
-            return
-        with open(pid_file) as f:
-            pid = int(f.read().strip())
-        
-        status_file = f"/proc/{pid}/status"
-        if not os.path.exists(status_file):
-            logging.warn(f"uuid:{mount_uuid} pid:{pid} status not exists")
-            return
-        
-        with open(status_file) as f:
-            status_lines = f.readlines()
-        
-        # 检查进程名称
-        name_matched = False
-        for line in status_lines:
-            if line.startswith("Name:"):
-                if "aliyun-alinas" in line:
-                    name_matched = True
-                break
+        probe = probe or efc_process.probe_efc(mount_uuid, EFC_WORKSPACE_DIR)
+        if probe.state == efc_process.EFC_DEAD:
+            _clear_zombie_detection(mount_uuid)
+            return efc_process.DETACH_RELEASED
+        if probe.state != efc_process.EFC_ZOMBIE_LOCKED:
+            _clear_zombie_detection(mount_uuid)
+            return efc_process.DETACH_ABORTED
 
-        # 检查是否僵尸状态
-        is_zombie = False
-        for line in status_lines:
-            if line.startswith("State:"):
-                # 状态格式: State: Z (zombie)
-                if "Z (zombie)" in line or "Z" in line:
-                    is_zombie = True
-                break
-        
-        # 如果不是僵尸状态或名称不匹配，清除记录并返回
-        if not is_zombie or not name_matched:
-            if pid in zombie_detection_times:
-                del zombie_detection_times[pid]
-                logging.warn(f"uuid:{mount_uuid} pid:{pid} name_matched:{name_matched} zombie:{is_zombie} is ok")
-            return
-        
-        # 记录僵尸检测时间
-        current_time = time.time()
-        if pid not in zombie_detection_times:
-            zombie_detection_times[pid] = current_time
-            logging.warn(f"uuid:{mount_uuid} pid:{pid} zombie:{is_zombie} first zombie")
-            return
-        
-        # 检查是否超时
-        zombie_duration = current_time - zombie_detection_times[pid]
+        key = (
+            mount_uuid,
+            probe.owner_pid,
+            probe.proc_starttime,
+            probe.lock_dev,
+            probe.lock_inode,
+        )
+        _clear_zombie_detection(mount_uuid, keep_key=key)
+        current_time = time.monotonic() if now is None else now
+        first_seen = zombie_detection_times.get(key)
+        if first_seen is None:
+            zombie_detection_times[key] = current_time
+            logging.warning(
+                'uuid:%s pid:%s zombie:True first zombie, inode:%s',
+                mount_uuid, probe.owner_pid, probe.lock_inode)
+            return efc_process.DETACH_WAIT
+
+        zombie_duration = current_time - first_seen
         if zombie_duration < UNAS_ZOMBIE_PROCESS_TIMEOUT:
-            logging.warn(f"uuid:{mount_uuid} pid:{pid} zombie time: {zombie_duration:.1f}s")
-            return
-        
-        logging.warn(f"uuid:{mount_uuid} pid:{pid} zombie time: {zombie_duration:.1f}s try remove lock")
-        del zombie_detection_times[pid]
-        os.remove(lock_file)
+            logging.warning(
+                'uuid:%s pid:%s zombie time: %.1fs, inode:%s',
+                mount_uuid, probe.owner_pid, zombie_duration, probe.lock_inode)
+            return efc_process.DETACH_WAIT
 
-    except Exception as e:
-        logging.error("try_remove_efc_lock_when_zombie error:{}".format(e), exc_info=True)
+        logging.warning(
+            'uuid:%s pid:%s zombie time: %.1fs try remove lock, inode:%s',
+            mount_uuid, probe.owner_pid, zombie_duration, probe.lock_inode)
+        result, current, detail = efc_process.detach_zombie_lock(
+            mount_uuid, probe, EFC_WORKSPACE_DIR)
+        if result in (efc_process.DETACH_DETACHED, efc_process.DETACH_RELEASED):
+            _clear_zombie_detection(mount_uuid)
+            logging.warning(
+                'uuid:%s pid:%s zombie lock result:%s detail:%s',
+                mount_uuid, probe.owner_pid, result, detail)
+        else:
+            logging.error(
+                'uuid:%s zombie lock detach aborted, result:%s state:%s detail:%s',
+                mount_uuid, result, current.state, detail)
+        return result
+    except Exception as error:
+        logging.error('try_remove_efc_lock_when_zombie error:%s', error,
+                      exc_info=True)
+        return efc_process.DETACH_ERROR
 
-def restart_unas_process(unas_state, state_file_dir = STATE_FILE_DIR): 
+def _run_restart_command(command, timeout=UNAS_RESTART_TIMEOUT,
+                         temp_dir='/var/run'):
+    """Run the mount command without PIPEs that descendants can keep open."""
+    with tempfile.TemporaryFile(dir=temp_dir) as stdout_file, \
+            tempfile.TemporaryFile(dir=temp_dir) as stderr_file:
+        proc = subprocess.Popen(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=stdout_file,
+            stderr=stderr_file,
+            shell=True,
+            executable='/bin/bash',
+            env=binary_path_env(),
+            start_new_session=True,
+        )
+        timed_out = False
+        try:
+            return_code = proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            return_code = -errno.ETIMEDOUT
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except OSError as error:
+                if error.errno != errno.ESRCH:
+                    logging.warning('kill timed out restart group failed: %s', error)
+            try:
+                proc.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                logging.error('restart command remains uninterruptible, pid:%s', proc.pid)
+
+        stdout_file.seek(0)
+        stderr_file.seek(0)
+        stdout = stdout_file.read(64 * 1024).decode('utf-8', errors='replace')
+        stderr = stderr_file.read(64 * 1024).decode('utf-8', errors='replace')
+        if timed_out:
+            stderr = ('restart command timed out after %ss; %s' % (timeout, stderr)).strip()
+        return return_code, stdout, stderr
+
+
+def _complete_unas_restart(unas_state, probe, mount_cmd=None):
+    """Finish either an immediately ready or a later-observed EFC restart."""
+    log_context = _clear_unas_restart(unas_state.mountuuid)
+    add_cgroup_limit(
+        mount_cmd or unas_state.mountcmd, unas_state.mountuuid,
+        efc_pid=probe.owner_pid)
+    # Case, prefix and command field are consumed by existing log alarms.
+    logging.info(
+        'Remount %s at %s, uuid:%s Successfully, %s',
+        unas_state.mountpath, unas_state.mountpoint,
+        unas_state.mountuuid,
+        log_context.get('command', mount_cmd or unas_state.mountcmd))
+
+
+def restart_unas_process(unas_state, state_file_dir=STATE_FILE_DIR,
+                         expected_probe=None, runner=None, now=None):
+    """Attempt recovery without waiting; return whether RUNNING was confirmed."""
     logging.debug("try restart eac, (mount_uuid:%s, mount_point:%s)" % (unas_state.mountuuid, unas_state.mountpoint))
 
-    try:
-        mount_uuid = unas_state.mountuuid
-        mount_cmd = adjust_mount_cmd_before_restart(unas_state.mountcmd, unas_state.mountpath)
-        mount_point = unas_state.mountpoint
-        errcode, _, errmsg = exec_cmd_in_subprocess(mount_cmd)
+    mount_uuid = unas_state.mountuuid
+    current_time = time.monotonic() if now is None else now
+    with restart_guard:
+        if mount_uuid in restart_in_progress:
+            logging.info('Skip duplicate EFC restart, mount_uuid:%s', mount_uuid)
+            return False
+        last_attempt = restart_attempt_times.get(mount_uuid)
+        if last_attempt is not None and current_time - last_attempt < UNAS_RESTART_RETRY_INTERVAL:
+            logging.info('Skip EFC restart during retry interval, mount_uuid:%s', mount_uuid)
+            return False
+        restart_in_progress.add(mount_uuid)
 
-        if errcode == 0:
-            add_cgroup_limit(mount_cmd, mount_uuid)
-            logging.info('Remount %s at %s, uuid:%s Successfully, %s', unas_state.mountpath, mount_point, mount_uuid, mount_cmd)
+    try:
+        if expected_probe is not None and expected_probe.state not in (
+                efc_process.EFC_DEAD, efc_process.EFC_ZOMBIE_LOCKED):
+            logging.warning(
+                'Reject EFC restart with unexpected prior state, '
+                'mount_uuid:%s state:%s', mount_uuid, expected_probe.state)
+            return False
+
+        # The caller normally holds the per-UUID state lock, but the mount can
+        # still disappear asynchronously after an older snapshot was taken.
+        # Never recreate an EFC for a mount that is no longer present.
+        current_mounts = get_current_unas_mounts(MOUNT_TYPE_ALL)
+        state = unas_state._asdict()
+        if not is_unas_process_mount_present(state, current_mounts):
+            _clear_unas_restart(mount_uuid)
+            logging.info(
+                'Cancel EFC restart because mount is no longer present, '
+                'mount_uuid:%s', mount_uuid)
+            return False
+
+        current_probe = efc_process.probe_efc(mount_uuid, EFC_WORKSPACE_DIR)
+        if current_probe.state != efc_process.EFC_DEAD:
+            logging.info(
+                'Cancel EFC restart after recheck, mount_uuid:%s state:%s reason:%s',
+                mount_uuid, current_probe.state, current_probe.reason)
+            return False
+
+        mount_cmd = unas_state.mountcmd
+        mount_point = unas_state.mountpoint
+        command_runner = runner or _run_restart_command
+        previous_log = (_restart_log_contexts.get(mount_uuid, {})
+                        if mount_uuid in restart_attempt_times else {})
+        unconfirmed_attempts = previous_log.get('unconfirmed_attempts', 0) + 1
+        _restart_log_contexts[mount_uuid] = {
+            'command': mount_cmd,
+            'unconfirmed_attempts': unconfirmed_attempts,
+        }
+        errcode, _, errmsg = command_runner(mount_cmd, UNAS_RESTART_TIMEOUT)
+        logging.info('EFC restart command completed, uuid:%s returncode=%d',
+                     mount_uuid, errcode)
+        # The daemon may not own its lock yet when the launcher returns.
+        # Give this UUID the existing retry interval, without blocking all
+        # other mounts. A later scan will confirm RUNNING and finish recovery.
+        restart_attempt_times[mount_uuid] = (
+            time.monotonic() if now is None else now)
+        post_probe = efc_process.probe_efc(mount_uuid, EFC_WORKSPACE_DIR)
+
+        if post_probe.state == efc_process.EFC_RUNNING:
+            _complete_unas_restart(unas_state, post_probe)
+            return True
         else:
-            logging.error('Failed to remount %s at %s, uuid:%s returncode=%d, stderr="%s"' % \
-                                (unas_state.mountpath, mount_point, mount_uuid, errcode, errmsg))
+            # Keep legacy ERROR keywords/fields for existing log alarms. A
+            # first rc=0 result can still be starting; only repeated attempts
+            # without a confirmed RUNNING owner escalate that case to ERROR.
+            if (errcode != 0 or unconfirmed_attempts >=
+                    UNAS_RESTART_UNCONFIRMED_ERROR_THRESHOLD):
+                logging.error(
+                    'Failed to remount %s at %s, uuid:%s returncode=%d, stderr="%s", '
+                    'restart not confirmed, post_state=%s reason:%s, '
+                    'unconfirmed_attempts=%d, retry_interval=%ss',
+                    unas_state.mountpath, mount_point, mount_uuid, errcode, errmsg,
+                    post_probe.state, post_probe.reason, unconfirmed_attempts,
+                    UNAS_RESTART_RETRY_INTERVAL)
+            else:
+                logging.info(
+                    'EFC restart not yet confirmed, %s at %s, uuid:%s returncode=%d, '
+                    'post_state=%s, retry_interval=%ss, stderr="%s"',
+                    unas_state.mountpath, mount_point, mount_uuid, errcode,
+                    post_probe.state, UNAS_RESTART_RETRY_INTERVAL, errmsg)
+            return False
 
     except Exception as e:
+        restart_attempt_times[mount_uuid] = (
+            time.monotonic() if now is None else now)
         logging.error('restart eac process failed: msg=%s', str(e))
-        raise
+        logging.error('Failed to remount %s at %s, uuid:%s, exception msg:%s',
+                      unas_state.mountpath, unas_state.mountpoint, mount_uuid, str(e))
+        return False
+    finally:
+        with restart_guard:
+            restart_in_progress.discard(mount_uuid)
 
 PAGE_SIZE = 4096
 
@@ -1232,15 +1536,15 @@ def get_unas_internal_info(mountpoint):
     res = 'EFC internal debug infos: inode:{}, page cache:{}, journal:{}, readdir cache:{}, tcmalloc:{}, volume shm:{}, file shm:{}, fh shm:{}, page shm:{}, journal shm:{}'.format(inode, pagecache, journal, readdircache, tcmalloc, volume_shm, file_shm, fh_shm, page_shm, journal_shm)
     return res
 
-def check_unas_process_mem(unas_state):
+def check_unas_process_mem(unas_state, probe=None):
     logging.debug("checking eac process mem_usage, (mount_uuid:%s, mount_point:%s)" % (unas_state.mountuuid, unas_state.mountpoint))
     try:
         mount_uuid = unas_state.mountuuid
-        pid = os.popen(PS_CMD + "| grep 'e[af]c' | grep mount_uuid=%s |grep -vw grep | awk '{print $1}'" % mount_uuid).read().strip()
-        if len(pid) == 0:
+        probe = probe or efc_process.probe_efc(mount_uuid, EFC_WORKSPACE_DIR)
+        if probe.state != efc_process.EFC_RUNNING:
             logging.debug("checking eac process mem_usage not exist, (mount_uuid:%s, mount_point:%s)" % (unas_state.mountuuid, unas_state.mountpoint))
             return
-        with open("/proc/%s/statm" % pid, 'r') as f:
+        with open("/proc/%s/statm" % probe.owner_pid, 'r') as f:
             stm = f.read().strip()
             resident = int(stm.split()[1]) * PAGE_SIZE
             share = int(stm.split()[2]) * PAGE_SIZE
@@ -1253,7 +1557,7 @@ def check_unas_process_mem(unas_state):
                 logging.error("checking eac process mem_usage oom, (mount_uuid:%s, mount_point:%s), statm:%s" % (unas_state.mountuuid, unas_state.mountpoint, stm))
                 if read_config().getboolean(WATCHDOG_CONFIG_SECTION, 'oom_kill', default=True):
                     logging.error("kill eac process, (mount_uuid:%s, mount_point:%s, debuginfo:%s)" % (unas_state.mountuuid, unas_state.mountpoint, get_unas_internal_info(unas_state.mountpoint)))
-                    kill_process_uuid(mount_uuid, 0)
+                    kill_process_uuid(mount_uuid, 0, probe)
     except Exception as e:
         logging.error('check eac process mem_usage failed: msg=%s', str(e))
 
@@ -1290,10 +1594,8 @@ def check_unas_sessmgr(state_file_dir = STATE_FILE_DIR):
     global sessmgr_restart_time
     try:
         with lock_state_file(state_file_dir, SESSMGR_LOCK, UNAS_LOCK_STATEFILE_TIMEOUT) as _:
-            cmd = PS_CMD + '| grep %s | grep -vw grep' % SESSMGR_BIN_PATH
-            info = os.popen(cmd).read()
             # sessmgr still alive
-            if len(info) > 0:
+            if process_probe.find_processes_by_exe((SESSMGR_BIN_PATH,)):
                 return
              
             sessmgr_conf_path = create_sessmgr_log_file() 
@@ -1320,20 +1622,21 @@ def check_unas_sessmgr(state_file_dir = STATE_FILE_DIR):
 
 def get_nas_agent_pids():
     try:
-        cmd = PS_CMD + "| grep '%s' | grep -vw grep | awk '{print $1}'" % NAS_AGENT_BIN_PATH
-        ret = os.popen(cmd).read().strip()
-        pids = [int(s) for s in ret.split('\n') if s]
-        return pids
+        return [identity.pid for identity in get_nas_agent_processes()]
     except Exception as e:
         logging.error('Failed to get nas agent pids, error: %s', str(e))
         return []
 
 
-def stop_nas_agent():
+def get_nas_agent_processes():
+    return process_probe.find_processes_by_exe((NAS_AGENT_BIN_PATH,))
+
+
+def stop_nas_agent(processes=None):
     try:
-        pids = get_nas_agent_pids()
-        for pid in pids:
-            os.kill(pid, signal.SIGKILL)
+        processes = processes if processes is not None else get_nas_agent_processes()
+        for identity in processes:
+            process_probe.signal_process_if_same(identity, signal.SIGKILL)
     except Exception as e:
         logging.error('Failed to stop nas agent, error: %s', str(e))
 
@@ -1343,9 +1646,12 @@ def check_nas_agent_state():
         # wait until nas agent config exists
         if not os.path.exists(NAS_AGENT_CONF_PATH):
             return
-        pids = get_nas_agent_pids()
-        if len(pids) < 2:
+        processes = get_nas_agent_processes()
+        if len(processes) < 2:
             NAS_AGENT_LOGGER.rollover()
+            # Re-scan immediately before signalling. nas-agent can fork after
+            # the health check, so killing only the old snapshot may leave a
+            # child behind and create duplicate collectors on restart.
             stop_nas_agent()
             cmd = "%s --logtail_sys_conf_dir=%s --ilogtail_config=%s" % (
                 NAS_AGENT_BIN_PATH, NAS_AGENT_SYS_CONF_DIR, NAS_AGENT_CONF_PATH)
@@ -1371,18 +1677,48 @@ def create_pexporter_log_file(global_log_dir=UNAS_LOG_DIR):
         if e.errno != errno.ENOENT and e.errno != errno.EEXIST:
             raise
 
+def _get_numa_node_from_state_files(state_file_dir=STATE_FILE_DIR):
+    """Extract numa_node from existing mount state files' mountcmd field."""
+    state_files = get_files_with_prefix(state_file_dir, 'eac-')
+    state_files.update(get_files_with_prefix(state_file_dir, 'efc-'))
+    for _, state_file in state_files.items():
+        try:
+            state_file_path = os.path.join(state_file_dir, state_file)
+            with open(state_file_path) as f:
+                state = json.load(f)
+            mountcmd = state.get('mountcmd', '')
+            match = re.search(r'numactl\s+--cpunodebind=(\S+)\s+--membind=\S+', mountcmd)
+            if match:
+                return match.group(1)
+        except Exception:
+            continue
+    return None
+
+
 def check_pexporter_state():
     # start exporter for Promethues
     try:
-        cmd = PS_CMD + '| grep %s | grep -vw grep' % PEXPORTER_BIN_PATH
-        info = os.popen(cmd).read()
         # still alive
-        if len(info) > 0:
+        if process_probe.find_processes_by_exe((PEXPORTER_BIN_PATH,)):
             return
          
         pexporter_conf_path = create_pexporter_log_file() 
         pexporter_log_path = " --apsara_log_conf_path=%s" % pexporter_conf_path
-        bootstrap_cmd = "nohup %s %s > %s/pexporter.out 2>&1 &" % (PEXPORTER_BIN_PATH, pexporter_log_path, LOG_DIR)
+
+        # NUMA binding: bind pexporter to the same numa node as the mount process
+        pexporter_cmd = PEXPORTER_BIN_PATH
+        numactl_path = shutil.which('numactl')
+        if numactl_path:
+            numa_node = _get_numa_node_from_state_files()
+            if numa_node is not None:
+                pexporter_cmd = 'numactl --cpunodebind=%s --membind=%s %s' % (numa_node, numa_node, PEXPORTER_BIN_PATH)
+                logging.info('pexporter: numactl found at %s, binding to numa node %s', numactl_path, numa_node)
+            else:
+                logging.info('pexporter: no numa node found in state files, starting pexporter without numactl')
+        else:
+            logging.info('pexporter: numactl not found, proceeding without numactl prefix')
+
+        bootstrap_cmd = "nohup %s %s > %s/pexporter.out 2>&1 &" % (pexporter_cmd, pexporter_log_path, LOG_DIR)
         errcode, _, errmsg = exec_cmd_in_subprocess(bootstrap_cmd)
 
         if errcode == 0:
@@ -1562,21 +1898,34 @@ def schedule_clean_up_mount_files(log_file_dir=LOG_DIR, state_file_dir=STATE_FIL
             continue
 
 
-def is_dadi_enabled():
+def _dadi_option_enabled(arg):
+    if arg.lower() == 'true':
+        return True
+    for char in arg:
+        if '1' <= char <= '9':
+            return True
+        if char != '0':
+            break
+    return False
+
+
+def is_dadi_enabled(state_file_dir=STATE_FILE_DIR):
     try:
-        ps_cmd = "ps -eww -o args | grep 'aliyun-alinas-e[af]c'"
-        ps_info = os.popen(ps_cmd).read()
-        for arg in re.findall('tier_EnableClusterCache=(\S+)', ps_info):
-            if arg.lower() == 'true':
-                return True
-            for c in arg:
-                if '1' <= c <= '9':
-                    return True
-                elif c != '0':
-                    break
+        state_files = get_files_with_prefix(state_file_dir, 'eac-')
+        state_files.update(get_files_with_prefix(state_file_dir, 'efc-'))
+        for state_file in state_files.values():
+            try:
+                with open(os.path.join(state_file_dir, state_file)) as state_stream:
+                    state = json.load(state_stream)
+                mount_cmd = state.get('mountcmd', '')
+                for arg in re.findall(r'tier_EnableClusterCache=([^,\s]+)', mount_cmd):
+                    if _dadi_option_enabled(arg):
+                        return True
+            except (IOError, OSError, TypeError, ValueError):
+                logging.warning('Skip invalid DADI state file: %s', state_file)
         return False
-    except Exception as e:
-        logging.warning('Failed to check if dadi is enabled')
+    except Exception:
+        logging.warning('Failed to check if dadi is enabled', exc_info=True)
         return False
 
 last_dadi_discover_time = 0
@@ -1689,12 +2038,14 @@ def check_certificate(config, state, state_file_dir, state_file, base_path=STATE
 
         # send SIGHUP to force a reload of the configuration file to trigger the stunnel process to notice the new certificate
         pid = state.get("pid")
-        if is_pid_running(pid):
-            process_group = os.getpgid(pid)
+        identity = get_stunnel_process_identity(state)
+        process_group = (
+            signal_stunnel_process_group_if_same(state, SIGHUP, identity)
+            if identity is not None else None)
+        if process_group is not None:
             logging.info(
                 "SIGHUP signal to stunnel. PID: %d, group ID: %s", pid, process_group
             )
-            os.killpg(process_group, SIGHUP)
         else:
             logging.warning("TLS tunnel is not running for %s", state_file)
 
@@ -2254,42 +2605,112 @@ def check_nfs_mounts(config, watchdog, unmount_grace_period_sec, state_file_dir=
     nfs_mounts = get_current_local_nfs_mounts()
     state_files = get_files_with_prefix(state_file_dir, 'alinas-')
     logging.debug('Current state files in "%s": %s', state_file_dir, list(state_files.values()))
-
-    ps_cmd = PS_CMD + "| grep stunnel-"
-    ps_info = os.popen(ps_cmd).read()
+    active_files = set(state_files.values())
+    for key in list(_stunnel_unknown_reports):
+        if key[0] == state_file_dir and key[1] not in active_files:
+            del _stunnel_unknown_reports[key]
 
     for local_dns, state_file in state_files.items():
+        key = (state_file_dir, state_file)
+        report = _stunnel_unknown_reports.get(key)
+        if report is not None:
+            report['seen_this_scan'] = False
+        stunnel_probe = None
         try:
             state = watchdog.load_state_file(state_file_dir, state_file)
             if not state:
+                _stunnel_unknown_reports.pop(key, None)
                 continue
 
-            is_running = False
-            # For compatibility: old version may not have 'uuid' in state
-            if is_pid_running(state['pid']) and ('uuid' not in state or state['uuid'] in ps_info):
-                is_running = True
+            probed_identity = (state.get('pid'), state.get(PROCESS_STARTTIME))
+            stunnel_probe = probe_stunnel_process(state)
+            if stunnel_probe.state == STUNNEL_UNKNOWN:
+                _report_stunnel_unknown(
+                    state_file_dir, state_file, state, stunnel_probe.reason)
+                continue
+            process_identity = stunnel_probe.identity
+            is_running = stunnel_probe.state == STUNNEL_RUNNING
+            if is_running and PROCESS_STARTTIME not in state:
+                state, stunnel_probe = refresh_and_pin_stunnel_identity(
+                    watchdog, state_file_dir, state_file, process_identity)
+                if not state:
+                    _stunnel_unknown_reports.pop(key, None)
+                    continue
+                if stunnel_probe.state == STUNNEL_UNKNOWN:
+                    _report_stunnel_unknown(
+                        state_file_dir, state_file, state,
+                        'identity recheck: %s' % stunnel_probe.reason)
+                    continue
+                process_identity = stunnel_probe.identity
+                is_running = stunnel_probe.state == STUNNEL_RUNNING
 
             current_time = time.time()
             if 'unmount_time' in state:
                 if state['unmount_time'] + unmount_grace_period_sec < current_time:
-                    logging.info('Unmount grace period expired for %s', state_file)
-                    clean_up_mount_state(state_file_dir, state_file, state['pid'], is_running, state.get('mountStateDir'))
+                    # The mount may have returned while an older missing-mount
+                    # snapshot was in its grace period. Never terminate its
+                    # proxy from that stale state.
+                    nfs_mounts = get_current_local_nfs_mounts()
+                    if local_dns in nfs_mounts:
+                        logging.info(
+                            'Cancel proxy cleanup because mount is present '
+                            'again, state_file:%s', state_file)
+                        del state['unmount_time']
+                        rewrite_state_file(state, state_file_dir, state_file)
+                    else:
+                        logging.info(
+                            'Unmount grace period expired for %s', state_file)
+                        clean_up_mount_state(
+                            state_file_dir, state_file, state['pid'], is_running,
+                            state.get('mountStateDir'), state=state,
+                            process_identity=process_identity,
+                            state_loader=watchdog.load_state_file)
             elif local_dns not in nfs_mounts:
-                logging.info('No mount found for "%s"', state_file)
-                mark_as_unmounted(state, state_file_dir, state_file, current_time)
+                logging.info('recheck mount for "%s"', state_file)
+                nfs_mounts = get_current_local_nfs_mounts()
+                if local_dns not in nfs_mounts:
+                    logging.info('No mount found for "%s"', state_file)
+                    mark_as_unmounted(state, state_file_dir, state_file, current_time)
             else:
                 if "certificate" in state:
                     check_certificate(config, state, state_file_dir, state_file)
                 if is_running:
                     logging.debug('Proxy for %s is running', state_file)
                 else:
-                    logging.warning('Proxy for %s is not running', state_file)
-                    restart_proxy(watchdog.child_procs, state, state_file_dir, state_file)
+                    # A mount can disappear after the loop snapshot. Refresh
+                    # immediately before restart so unmount never creates a
+                    # replacement proxy.
+                    nfs_mounts = get_current_local_nfs_mounts()
+                    if local_dns not in nfs_mounts:
+                        logging.info(
+                            'Cancel proxy restart because mount disappeared, '
+                            'state_file:%s', state_file)
+                        mark_as_unmounted(
+                            state, state_file_dir, state_file, current_time)
+                    else:
+                        logging.warning(
+                            'Proxy for %s is not running', state_file)
+                        restart_proxy(
+                            watchdog.child_procs, state,
+                            state_file_dir, state_file)
         except MemoryError:
             raise
         except Exception as e:
             logging.exception('OS errors, just retry later: local_dns=%s, error=%s', local_dns, str(e))
             time.sleep(30)
+        finally:
+            # Do not clear on an intermediate RUNNING/DEAD if a later check
+            # deferred the action as UNKNOWN in this same scan.
+            report = _stunnel_unknown_reports.get(key)
+            if (report is not None and stunnel_probe is not None
+                    and not report['seen_this_scan']):
+                del _stunnel_unknown_reports[key]
+                if report['identity'] == probed_identity:
+                    logging.info(
+                        'Proxy process probe recovered from UNKNOWN, '
+                        'state_file:%s pid:%s duration_sec:%.1f count:%d',
+                        os.path.join(state_file_dir, state_file), report['identity'][0],
+                        time.monotonic() - report['first_seen'], report['count'])
 
     return nfs_mounts
 
@@ -2351,6 +2772,15 @@ def is_unas_bindroot_mounted(state, unas_proc_mounts):
                     return True
     return False
 
+
+def is_unas_process_mount_present(state, unas_proc_mounts):
+    """Return whether this state still has a mount that requires its EFC."""
+    local_mount_dns = state['mountuuid'] + ':' + state['mountpath']
+    return bool(
+        is_unas_mounted(state, local_mount_dns, unas_proc_mounts)
+        or is_unas_bindroot_mounted(state, unas_proc_mounts)
+    )
+
 def is_unas_bindroot_mount_exist(mount_uuid, unas_proc_mounts):
     for m in unas_proc_mounts:
         split_dns = m.server.split(':')
@@ -2404,17 +2834,6 @@ def clean_up_unas_workspace(mount_uuid):
             os.remove(file)
     logging.warning('Cleanup unas workspace with mountuuid:%s', mount_uuid)
 
-def get_process_pid(process_regex):
-    pid = 0
-    try:
-        cmd = PS_CMD + "| grep '%s' | grep -vw grep | awk '{print $1}'" % process_regex
-        ret = os.popen(cmd).read().strip()
-        if ret.isdigit():
-            pid = int(ret)
-    except:
-        logging.exception('get process pid value error: regex:%s', process_regex)
-    return pid
-
 def get_connection_id(mount_uuid, mount_dir=None):
     conn_id = 0
     if mount_uuid:
@@ -2429,46 +2848,91 @@ def get_connection_id(mount_uuid, mount_dir=None):
         logging.exception('get connection id value error: mount_uuid:%s, mount_dir:%s', mount_uuid or '', mount_dir or '')
     return conn_id
 
-def get_process_alive_sec(pid):
-    alive = 0
-    try:
-        cmd = "ps -p %d -oetime= | tr '-' ':' | awk -F: '{ total=0; m=1; } { for (i=0; i < NF; i++) {total += $(NF-i)*m; m *= i >= 2 ? 24 : 60 }} {print total}'" % pid
-        ret = os.popen(cmd).read().strip()
-        if ret.isdigit():
-            alive = int(ret)
-    except:
-        logging.exception('get process alive value error: pid:%d', pid)
-    return alive
+def kill_process_uuid(mount_uuid, min_alive_sec=0, expected_probe=None):
+    probe = efc_process.probe_efc(mount_uuid, EFC_WORKSPACE_DIR)
+    if probe.state != efc_process.EFC_RUNNING:
+        logging.info('Skip kill EFC uuid:%s state:%s', mount_uuid, probe.state)
+        return False
+    if expected_probe is not None and not efc_process.same_lock_identity(expected_probe, probe):
+        logging.warning('Skip kill EFC uuid:%s because lock owner changed', mount_uuid)
+        return False
 
-def kill_process_uuid(mount_uuid, min_alive_sec=0):
-    ps_cmd = PS_CMD + "| grep 'e[af]c'"
-    ps_info = os.popen(ps_cmd).read()
-    regex_mount = 'mount_uuid=%s' % mount_uuid 
-    if regex_mount in ps_info:
-        pid = get_process_pid(regex_mount)
-        alive_sec = get_process_alive_sec(pid)
-        if pid > 1 and alive_sec >= min_alive_sec:
-            kill_cmd = "kill -9 %d" % pid
-            errcode, _, _ = exec_cmd_in_subprocess(kill_cmd)
-            logging.error("eac process killed uuid:%s pid: %d" % (mount_uuid, pid))
-            if errcode != 0:
-                raise RuntimeError('Fail to kill eac process when drop eac mount, uuid:%s', mount_uuid)
+    alive_sec = efc_process.process_alive_seconds(probe)
+    if alive_sec < min_alive_sec:
+        return False
+
+    # Narrow the PID-reuse/owner-change window before sending a destructive
+    # signal. Python 3.6 has no pidfd, so revalidate the lock identity as close
+    # to os.kill() as practical.
+    confirmed = efc_process.probe_efc(mount_uuid, EFC_WORKSPACE_DIR)
+    if (confirmed.state != efc_process.EFC_RUNNING
+            or not efc_process.same_lock_identity(probe, confirmed)):
+        logging.warning('Skip kill EFC uuid:%s because lock owner changed',
+                        mount_uuid)
+        return False
+    try:
+        os.kill(confirmed.owner_pid, signal.SIGKILL)
+        logging.error('eac process killed uuid:%s pid: %d',
+                      mount_uuid, confirmed.owner_pid)
+        return True
+    except OSError as error:
+        if error.errno == errno.ESRCH:
+            return False
+        raise RuntimeError(
+            'Fail to kill eac process when drop eac mount, uuid:%s, error:%s' %
+            (mount_uuid, error))
 
 def drop_unas_mount(state, watchdog, state_file_dir, state_file):
     mount_uuid = state['mountuuid']
     mount_point = state['mountpoint']
    
     try: 
-        # for bindroot mount, do umount bindroot first
+        # Refresh under the caller's UUID lock. The snapshot which started the
+        # grace period may predate a remount or a completed state transition.
         unas_proc_mounts = get_current_unas_mounts(MOUNT_TYPE_ALL)
         if mount_uuid.startswith(BIND_ROOT_PREFIX):
-            if check_unas_bindroot_ref_zero(mount_uuid, mount_point, unas_proc_mounts):
-                if not clean_bindroot(mount_uuid, mount_point, state):
-                    # if umount fail too long, try kill process and retry
-                    current_time = time.time()
-                    if state['fail_check_time'] + UNAS_UMOUNT_FAIL_TIMEOUT < current_time:
-                        kill_process_uuid(mount_uuid, UNAS_UMOUNT_KILL_PROCESS_MIN_ALIVE)
-                    return
+            if not check_unas_bindroot_ref_zero(
+                    mount_uuid, mount_point, unas_proc_mounts):
+                logging.info(
+                    'Cancel cleanup because bindroot has active references, '
+                    'mount_uuid:%s', mount_uuid)
+                if 'fail_check_time' in state:
+                    del state['fail_check_time']
+                    rewrite_state_file(state, state_file_dir, state_file)
+                return False
+            if not clean_bindroot(mount_uuid, mount_point, state):
+                # If umount has failed for a long time, killing EFC is an
+                # intentional last resort. Recheck that no bind reference was
+                # added while clean_bindroot was running before doing so.
+                current_time = time.time()
+                unas_proc_mounts = get_current_unas_mounts(MOUNT_TYPE_ALL)
+                if (state['fail_check_time'] + UNAS_UMOUNT_FAIL_TIMEOUT < current_time
+                        and check_unas_bindroot_ref_zero(
+                            mount_uuid, mount_point, unas_proc_mounts)):
+                    kill_process_uuid(
+                        mount_uuid, UNAS_UMOUNT_KILL_PROCESS_MIN_ALIVE)
+                return False
+        elif is_unas_mounted(
+                state, mount_uuid + ':' + state['mountpath'], unas_proc_mounts):
+            logging.info(
+                'Cancel cleanup because mount is present again, mount_uuid:%s',
+                mount_uuid)
+            if 'fail_check_time' in state:
+                del state['fail_check_time']
+                rewrite_state_file(state, state_file_dir, state_file)
+            return False
+
+        # Recheck immediately before killing. This is deliberately separate
+        # from the check above because bindroot cleanup can change mount state.
+        unas_proc_mounts = get_current_unas_mounts(MOUNT_TYPE_ALL)
+        if is_unas_process_mount_present(state, unas_proc_mounts):
+            logging.info(
+                'Cancel cleanup before kill because mount is present, '
+                'mount_uuid:%s', mount_uuid)
+            if 'fail_check_time' in state:
+                del state['fail_check_time']
+                rewrite_state_file(state, state_file_dir, state_file)
+            return False
 
         # try kill eac process for safety
         kill_process_uuid(mount_uuid)
@@ -2491,8 +2955,10 @@ def drop_unas_mount(state, watchdog, state_file_dir, state_file):
             clean_up_unas_workspace(mount_uuid)
             clean_up_unas_state(state_file_dir, state_file, state)
             logging.info('success clean eac mount files, %s', mount_uuid)
+            return True
         else:
             logging.error('fail clean eac mount files, mount_point still exists, %s', mount_uuid)
+        return False
 
     except Exception as e:
         logging.exception('drop eac mount failed: uuid:%s, msg=%s', mount_uuid, str(e))
@@ -2630,11 +3096,6 @@ def check_unas_mounts(watchdog, state_file_dir=STATE_FILE_DIR):
 
     unas_mounts = {}
     try:
-
-        # check unas mounts      
-        ps_cmd = PS_CMD + "| grep 'e[af]c'"
-        ps_info = os.popen(ps_cmd).read()
-
         for _, state_file in state_files.items():
             try:
                 state = watchdog.load_state_file(state_file_dir, state_file)
@@ -2642,27 +3103,45 @@ def check_unas_mounts(watchdog, state_file_dir=STATE_FILE_DIR):
                    continue
 
                 mount_uuid = state['mountuuid']
-                local_mount_dns = state['mountuuid'] + ':' + state['mountpath']
                 uuid_lock_name = state['mountkey']
-
-                bind_tag = ''
-                if BIND_TAG in state:
-                    bind_tag = state[BIND_TAG]
-                sessmgr_required = True
-                if SESSMGR_REQUIRED in state:
-                    sessmgr_required = state[SESSMGR_REQUIRED]
-
-                unas_state = UnasState(state['mountuuid'], state['mountpoint'], state['mountpath'], state['mountcmd'], state['mountkey'], bind_tag, sessmgr_required)
-                with lock_state_file(STATE_FILE_DIR, uuid_lock_name, UNAS_LOCK_STATEFILE_TIMEOUT):
+                with lock_state_file(state_file_dir, uuid_lock_name, UNAS_LOCK_STATEFILE_TIMEOUT):
                     if skip_check_unas_mounts():
                         return unas_mounts
                     # get state again with uuid lock held
                     state = watchdog.load_state_file(state_file_dir, state_file)
                     if not state:
                         continue
-                    if is_unas_bindroot_mounted(state, unas_proc_mounts) and not is_unas_running(unas_state, ps_info):
+                    if (state.get('mountuuid') != mount_uuid
+                            or state.get('mountkey') != uuid_lock_name):
+                        logging.warning(
+                            'Skip EFC check because state identity changed while '
+                            'waiting for UUID lock, state_file:%s', state_file)
+                        continue
+
+                    local_mount_dns = (
+                        state['mountuuid'] + ':' + state['mountpath'])
+                    bind_tag = state.get(BIND_TAG, '')
+                    sessmgr_required = state.get(SESSMGR_REQUIRED, True)
+                    unas_state = UnasState(
+                        state['mountuuid'], state['mountpoint'],
+                        state['mountpath'], state['mountcmd'],
+                        state['mountkey'], bind_tag, sessmgr_required)
+
+                    probe = efc_process.probe_efc(mount_uuid, EFC_WORKSPACE_DIR)
+                    is_running = probe.state == efc_process.EFC_RUNNING
+                    # Keep the single loop snapshot for healthy mounts. Before
+                    # any missing-mount or non-running action, refresh under
+                    # the UUID lock so mount and process state describe the
+                    # same serialized workflow point.
+                    if (not is_running
+                            or not is_unas_mounted(
+                                state, local_mount_dns, unas_proc_mounts)):
+                        unas_proc_mounts = get_current_unas_mounts(
+                            MOUNT_TYPE_ALL)
+                    if is_unas_bindroot_mounted(state, unas_proc_mounts) and not is_running:
                         pass
                     elif not is_unas_mounted(state, local_mount_dns, unas_proc_mounts):
+                        _clear_unas_restart(mount_uuid)
                         current_time = time.time()
                         if 'fail_check_time' in state:
                             if state['fail_check_time'] + UNAS_MOUNT_FAIL_MAX_CHECK_TIME < current_time:
@@ -2678,29 +3157,53 @@ def check_unas_mounts(watchdog, state_file_dir=STATE_FILE_DIR):
                         del state['fail_check_time']
                         rewrite_state_file(state, state_file_dir, state_file)
 
-                    check_unas_process_mem(unas_state)
-         
-                    if not is_unas_running(unas_state, ps_info):
-                        if os.path.exists('%s/%s' % (EFC_WORKSPACE_DIR, "sidecar_exit")) \
-                            and not os.path.exists('%s/%s.%s' % (EFC_WORKSPACE_DIR, mount_uuid, EFC_LOCK_SUFFIX)):
+                    if probe.state == efc_process.EFC_RUNNING:
+                        _clear_zombie_detection(mount_uuid)
+                        if mount_uuid in restart_attempt_times:
+                            _complete_unas_restart(unas_state, probe)
+                        check_unas_process_mem(unas_state, probe)
+                    elif probe.state == efc_process.EFC_DEAD:
+                        _clear_zombie_detection(mount_uuid)
+                        if (os.path.exists('%s/%s' % (EFC_WORKSPACE_DIR, "sidecar_exit"))
+                                and not os.path.exists(probe.lock_path)):
                             # happens in vfuse environment
                             # when efc exited safely after cleaning up its workspace while leaving a mount record in vfuse
                             # in this case, we ignore it
-                            logging.info('Check eac status failed, mount_uuid:%s, no restart because efc lock not exist' % state['mountuuid'])
+                            logging.info(
+                                'Check eac status failed, mount_uuid:%s, '
+                                'no restart because efc lock not exist', mount_uuid)
                         else:
-                            # efc failover
-
-                            try_remove_efc_lock_when_zombie(mount_uuid)
-
-                            logging.info('Check eac status failed, mount_uuid:%s, try restart' % state['mountuuid'])
-                            restart_unas_process(unas_state)
-                            
-                    else: 
-                        # eac mounts not needed processing by LiveDetector
-                        # compose local dns by mount_uuid for live detector
-                        #local_dns = 'eac-%s' % state['mountuuid']
-                        #unas_mounts[local_dns] = state
-                        pass
+                            confirmed = efc_process.probe_efc(
+                                mount_uuid, EFC_WORKSPACE_DIR)
+                            if confirmed.state == efc_process.EFC_DEAD:
+                                logging.info(
+                                    'Check eac status failed, mount_uuid:%s, try restart',
+                                    mount_uuid)
+                                restart_unas_process(
+                                    unas_state, expected_probe=confirmed)
+                            else:
+                                logging.info(
+                                    'Cancel EFC restart because state changed, '
+                                    'mount_uuid:%s state:%s reason:%s',
+                                    mount_uuid, confirmed.state, confirmed.reason)
+                    elif probe.state == efc_process.EFC_ZOMBIE_LOCKED:
+                        detach_result = try_remove_efc_lock_when_zombie(
+                            mount_uuid, probe)
+                        if detach_result in (
+                                efc_process.DETACH_DETACHED,
+                                efc_process.DETACH_RELEASED):
+                            logging.info(
+                                'Check eac status failed, mount_uuid:%s, try restart, '
+                                'zombie lock detached or released',
+                                mount_uuid)
+                            restart_unas_process(
+                                unas_state, expected_probe=probe)
+                    else:
+                        _clear_zombie_detection(mount_uuid)
+                        logging.error(
+                            'Skip EFC restart, mount_uuid:%s state:%s '
+                            'owner_pid:%s reason:%s',
+                            mount_uuid, probe.state, probe.owner_pid, probe.reason)
 
                     update_monitor_metrics(state)
 
@@ -3041,7 +3544,8 @@ class LiveDetector(object):
                 logging.error('State file not found for %s', local_dns)
                 continue
 
-            timeout = state.get('timeo', 30) / 2
+            #timeout = state.get('timeo', 30) / 2
+            timeout = 1800
             mountpoint = state.get('mountpoint', None)
             if not mountpoint:
                 logging.error('Mountpath is not specified: local_dns=%s', local_dns)
@@ -3227,6 +3731,23 @@ class NasAgentLogger(object):
             self._lock.release()
 
 
+def get_node_id(state_file_dir, mount_uuid):
+    """Get nodeid from state file's mountcmd field for given mount_uuid"""
+    state_file_name = unas_state_file_name(mount_uuid)
+    state_file_path = os.path.join(state_file_dir, state_file_name)
+    try:
+        with open(state_file_path) as f:
+            state = json.load(f)
+            mountcmd = state.get('mountcmd', '')
+            # nodeid is in -o options, comma-separated: ...,node_id=xxx,...
+            match = re.search(r'(?:^|,)node_id=([^,\s]+)', mountcmd)
+            if match:
+                return match.group(1)
+    except (IOError, ValueError, KeyError) as e:
+        logging.debug('Failed to get nodeid from state file %s: %s', state_file_path, str(e))
+    return ""
+
+
 def parse_mountpoint(mountpoint):
     for fs_cat, mp_pat in NAS_AGENT_MOUNTPOINT_PATTERNS.items():
         mp_match = mp_pat.match(mountpoint)
@@ -3326,10 +3847,10 @@ class Command(object):
     def tasks(self, mount_entities, args=None):
         if self.is_independent:
             regions = set(e.region for e in mount_entities)
-            return [("", "", regions, self._precondition, self._task, self._ignore_error)]
+            return [("", "", "", regions, self._precondition, self._task, self._ignore_error)]
         elif self.is_periodic:
             tasks = []
-            for client_type, pid, uuid, connid, fsid, _, region, _, entries in mount_entities:
+            for client_type, pid, uuid, connid, fsid, nodeid, _, region, _, entries in mount_entities:
                 if not self.match_client_type(client_type):
                     continue
                 task = self._task
@@ -3342,10 +3863,10 @@ class Command(object):
                 precondition = self._precondition
                 if precondition:
                     precondition = re.sub(NAS_AGENT_UUID_PATTERN, uuid, precondition)
-                tasks.append((uuid, fsid, [region], precondition, task, self._ignore_error))
+                tasks.append((uuid, fsid, nodeid, [region], precondition, task, self._ignore_error))
             return tasks
         elif self.event == self.EVENT_ADD_MOUNT or self.event == self.EVENT_DEL_MOUNT:
-            path, mountpoint, (client_type, pid, uuid, connid, fsid, _, region, *_) = args
+            path, mountpoint, (client_type, pid, uuid, connid, fsid, nodeid, _, region, _, _) = args
             if not self.match_client_type(client_type):
                 return tasks
             task = self._task
@@ -3357,9 +3878,9 @@ class Command(object):
             precondition = self._precondition
             if precondition:
                 precondition = re.sub(NAS_AGENT_UUID_PATTERN, uuid, precondition)
-            return [(uuid, fsid, [region], precondition, task, self._ignore_error)]
+            return [(uuid, fsid, nodeid, [region], precondition, task, self._ignore_error)]
         else:
-            opid, (client_type, pid, uuid, connid, fsid, _, region, *_) = args
+            opid, (client_type, pid, uuid, connid, fsid, nodeid, _, region, _, _) = args
             if not self.match_client_type(client_type):
                 return tasks
             task = self._task
@@ -3370,7 +3891,7 @@ class Command(object):
             precondition = self._precondition
             if precondition:
                 precondition = re.sub(NAS_AGENT_UUID_PATTERN, uuid, precondition)
-            return [(uuid, fsid, [region], precondition, task, self._ignore_error)]
+            return [(uuid, fsid, nodeid, [region], precondition, task, self._ignore_error)]
 
     def _parse_json_format(self, last_result, exe_time, output):
         try:
@@ -3420,13 +3941,54 @@ class Command(object):
             if rtype == 'complex':
                 expr = rule.get('expr')
                 if expr['type'] == 'div':
+                    num = value - last_sub_inner[name]
                     divisor_diff = sub_inner[expr['divisor']] - last_sub_inner[expr['divisor']]
-                    if divisor_diff <= 0:
+                    if num < 0 or divisor_diff <= 0:
                         continue
-                    fields[target] = (value - last_sub_inner[name]) / divisor_diff
+                    fields[target] = num / divisor_diff
             elif rtype == 'compute':
-                fields[target] = (value - last_sub_inner[name]) / duration
+                num = value - last_sub_inner[name]
+                if num < 0:
+                    continue
+                fields[target] = num / duration
         return fields
+
+    def _parse_fuse_io_stat(self, result):
+        """
+        Parse fuse ios stat
+        
+        format is (words are all lower case and sorted):
+
+        FUSE_LOOKUP: total reqs: 13593, tot_time_avg: 58
+        FUSE_MKNOD: total reqs: 3, tot_time_avg: 31507
+        FUSE_MKDIR: total reqs: 5535, tot_time_avg: 32
+        FUSE_OPEN: total reqs: 3863537, tot_time_avg: 10
+        FUSE_CREATE: total reqs: 7903, tot_time_avg: 40
+        FUSE_WRITE: total reqs: 3848217, tot_time_avg: 50
+        FUSE_GETATTR: total reqs: 3874757, tot_time_avg: 15
+        FUSE_SETATTR: total reqs: 1195666, tot_time_avg: 109
+
+        """
+        _, output = result
+        if not output:
+            return None
+        try:
+            fields = {}
+            # The upstream shell pipeline lowercases the content and joins all
+            # lines with spaces, so records look like:
+            #   "fuse_lookup: total reqs: 13593, tot_time_avg: 58 "
+            # field_name is the part after 'fuse_' (e.g. 'lookup'),
+            # value is the number after 'total reqs:'.
+            pattern = re.compile(r'fuse_(\w+):\s*total\s+reqs:\s*(\d+)')
+            for match in pattern.finditer(output):
+                field_name = match.group(1)
+                value = int(match.group(2))
+                fields[field_name] = value
+            return fields
+        except (ValueError, TypeError) as e:
+            logging.error('Failed to parse fuse_io_stat output: %s', str(e))
+            return None
+
 
     def _match_rules(self, last_result, result):
         exe_time, output = result
@@ -3435,6 +3997,9 @@ class Command(object):
 
         if self._format == 'json':
             return self._parse_json_format(last_result, exe_time, output)
+
+        if self._name == 'efc_fuse_total_reqs':
+            return self._parse_fuse_io_stat(result)
 
         rows = output.split('\n')
         units = [[row, *row.split()] for row in rows]
@@ -3519,7 +4084,7 @@ class Command(object):
                 logging.error('Unknown rule type %s in task %s', rtype, self.name)
         return fields
 
-    def parse(self, uuid, fsid, last_result, result):
+    def parse(self, uuid, fsid, nodeid, last_result, result):
         exe_time, output = result
         record = {
             'type': self.target,
@@ -3528,7 +4093,7 @@ class Command(object):
             'version': self.version,
         }
         if uuid:
-            record.update({'mountuuid': uuid, 'fsid': fsid})
+            record.update({'mountuuid': uuid, 'fsid': fsid, 'nodeid': nodeid})
 
         if self._rules is None:
             record.update({self.target: output})
@@ -3576,7 +4141,7 @@ class CommandTask(object):
             else:
                 tasks = command.tasks(mount_entities, self._command_args)
             results = {}
-            for uuid, fsid, regions, precondition, task, _ignore_error in tasks:
+            for uuid, fsid, nodeid, regions, precondition, task, _ignore_error in tasks:
                 if precondition:
                     rc, exe_time, output = self._execute(precondition, ignore_error=True)
                     if rc != 0:
@@ -3591,7 +4156,7 @@ class CommandTask(object):
                     last_result = None
                 else:
                     last_result = self._command_args.get(uuid)
-                record = command.parse(uuid, fsid, last_result, (exe_time, output))
+                record = command.parse(uuid, fsid, nodeid, last_result, (exe_time, output))
                 if record is not None:
                     if not regions and self._env_monitor.default_region:
                         regions.add(self._env_monitor.default_region)
@@ -3982,10 +4547,11 @@ class UpdateMountEntitiesTask(object):
             if mount_uuid in mount_entities:
                 mount_entities[mount_uuid].entries.append((path, mount.mountpoint))
                 continue
-            pid = get_process_pid('mount_uuid=%s' % mount_uuid)
-            if pid == 0:
+            probe = efc_process.probe_efc(mount_uuid, EFC_WORKSPACE_DIR)
+            pid = (probe.owner_pid
+                   if probe.state == efc_process.EFC_RUNNING else -1)
+            if pid == -1:
                 logging.warning('Fail to get pid for %s', mount_uuid)
-                pid = -1
                 # use pid as -1 below, for sometimes the efc process is not running
             conn_id = get_connection_id(mount_uuid)
             if conn_id == 0:
@@ -3993,7 +4559,8 @@ class UpdateMountEntitiesTask(object):
             last_requests = self._total_requests.get(mount_uuid, {})
             state, curr_requests = self._check_efc_state(fsid, mount_uuid, conn_id, last_requests)
             self._total_requests[mount_uuid] = curr_requests
-            mount_entities[mount_uuid] = MountEntity._make([NAS_AGENT_CLIENT_TYPE_EFC, pid, mount_uuid, conn_id, fsid, fstype, region, state, [(path, mount.mountpoint)]])
+            nodeid = get_node_id(STATE_FILE_DIR, mount_uuid)
+            mount_entities[mount_uuid] = MountEntity._make([NAS_AGENT_CLIENT_TYPE_EFC, pid, mount_uuid, conn_id, fsid, nodeid, fstype, region, state, [(path, mount.mountpoint)]])
 
         mounts = get_current_nfs_mounts()
         for mount in mounts:
@@ -4010,7 +4577,7 @@ class UpdateMountEntitiesTask(object):
             if mount_uuid in mount_entities:
                 mount_entities[mount_uuid].entries.append((path, mount.mountpoint))
             else:
-                mount_entities[mount_uuid] = MountEntity._make([client_type, None, mount_uuid, conn_id, fsid, fstype, region, self.STATE_NORMAL, [(path, mount.mountpoint)]])
+                mount_entities[mount_uuid] = MountEntity._make([client_type, None, mount_uuid, conn_id, fsid, "", fstype, region, self.STATE_NORMAL, [(path, mount.mountpoint)]])
 
         for entity in mount_entities.values():
             entity.entries.sort()
@@ -4203,7 +4770,7 @@ class EnvMonitor(object):
                 any(e.state != UpdateMountEntitiesTask.STATE_NORMAL for e in mount_entities)):
             epoch = int(time.time() * 1000)
             now = datetime.now()
-            for client_type, pid, uuid, connid, fsid, fstype, region, state, entries in mount_entities:
+            for client_type, pid, uuid, connid, fsid, nodeid, fstype, region, state, entries in mount_entities:
                 record = {
                     'type': 'mount_info',
                     'hostaddr': self._hostaddr,
@@ -4214,6 +4781,7 @@ class EnvMonitor(object):
                     'mountuuid': uuid,
                     'connid': connid,
                     'fsid': fsid,
+                    'nodeid': nodeid,
                     'fstype': fstype,
                     'state': state,
                     'entries': ' '.join(str(e) for e in entries),
@@ -4508,4 +5076,3 @@ def main():
 
 if '__main__' == __name__:
     main()
-

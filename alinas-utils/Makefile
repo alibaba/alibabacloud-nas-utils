@@ -60,6 +60,8 @@ tarball: clean
 	cp -rp src/cpfs/cpfs_nfs_common $(PACKAGE_NAME)/src/cpfs
 	cp -rp src/alinas/mount_alinas $(PACKAGE_NAME)/src/alinas
 	cp -rp src/alinas/watchdog $(PACKAGE_NAME)/src/alinas
+	cp -p src/alinas/efc_process.py $(PACKAGE_NAME)/src/alinas
+	cp -p src/alinas/process_probe.py $(PACKAGE_NAME)/src/alinas
 
 	cp -rp dist/nas_agent $(PACKAGE_NAME)/dist
 	cp -rp src/alinas/nas_agent $(PACKAGE_NAME)/src/alinas

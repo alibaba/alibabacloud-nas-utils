@@ -132,29 +132,15 @@ def test_create_unas_mount_dir(mocker, tmpdir):
 
 def test_check_sessmgr_alive(mocker):
     # sessmgr already alive
-    alive_process = "echo %s" % SESSMGR_BIN_NAME
-    fd = os.popen(alive_process)
-    mock = mocker.patch("os.popen", return_value=fd)
+    find = mocker.patch(
+        'mount_alinas.process_probe.find_processes_by_exe',
+        return_value=[mocker.Mock()],
+    )
     assert mount_alinas.check_sessmgr_alive() == True
 
     # sessmgr not alive
-    alive_process = "echo eac"
-    fd = os.popen(alive_process)
-    mock = mocker.patch("os.popen", return_value=fd)
+    find.return_value = []
     assert mount_alinas.check_sessmgr_alive() == False
-
-def test_check_watchdog_alive(mocker):
-    # watchdog already alive
-    alive_process = "echo %s" % WATCHDOG_BIN_NAME
-    fd = os.popen(alive_process)
-    mock = mocker.patch("os.popen", return_value=fd)
-    assert mount_alinas.check_watchdog_alive() == True
-
-    # watchdog not alive
-    alive_process = "echo eac"
-    fd = os.popen(alive_process)
-    mock = mocker.patch("os.popen", return_value=fd)
-    assert mount_alinas.check_watchdog_alive() == False
 
 def test_start_sessmgr(mocker, tmpdir):
     pmock = _mock_popen(mocker)
@@ -217,27 +203,115 @@ def test_gen_unas_mount_cmd(mocker):
     mount_path = 'mount_path_test'
     mount_options = {}
     log_path = 'log_path_test'
-    mount_cmd = mount_alinas.gen_unas_mount_cmd(mount_uuid, mount_point, mount_path, mount_options, log_path)
+    vsc_log_path = 'vsc_log_path_test'
+
+    # Case 1: numactl is available
+    mocker.patch('shutil.which', return_value='/usr/bin/numactl')
+    mount_cmd = mount_alinas.gen_unas_mount_cmd(mount_uuid, mount_point, mount_path, mount_options, log_path, vsc_log_path)
     assert mount_cmd.find(mount_uuid) != -1
     assert mount_cmd.find(mount_point) != -1
     assert mount_cmd.find(mount_path) != -1
     assert mount_cmd.find(log_path) != -1
+    assert mount_cmd.find('numactl --interleave=all') != -1
+    assert mount_cmd.startswith('numactl --interleave=all ')
+
+    # Case 2: numactl is NOT available
+    mocker.patch('shutil.which', return_value=None)
+    mount_cmd = mount_alinas.gen_unas_mount_cmd(mount_uuid, mount_point, mount_path, mount_options, log_path, vsc_log_path)
+    assert mount_cmd.find(mount_uuid) != -1
+    assert mount_cmd.find(mount_point) != -1
+    assert mount_cmd.find(mount_path) != -1
+    assert mount_cmd.find(log_path) != -1
+    assert mount_cmd.find('numactl') == -1
 
 
 def test_wait_mount_completed(mocker):
     mount_uuid = "mount_uuid_test"
     mount_path = 'dns_test:/'
-    gmock = mocker.patch('mount_alinas.get_current_unas_mounts', return_value=[])
+    mocker.patch('mount_alinas.check_fuse_protocol', return_value=True)
+    clock = {'now': 0.0}
+    mocker.patch(
+        'mount_alinas.time.monotonic', side_effect=lambda: clock['now'])
+    mocker.patch(
+        'mount_alinas.time.sleep',
+        side_effect=lambda seconds: clock.update(now=clock['now'] + seconds))
+    gmock = mocker.patch(
+        'mount_alinas.get_current_unas_mounts', return_value=[])
+    probe = mocker.patch(
+        'mount_alinas.efc_process.probe_efc',
+        return_value=MagicMock(state=mount_alinas.efc_process.EFC_DEAD),
+    )
 
-    # mount info failed updated
-    succ = mount_alinas.wait_mount_completed(mount_uuid, mount_path)
+    # A persistently dead process is rejected after the startup grace period.
+    succ = mount_alinas.wait_mount_completed(
+        mount_uuid, mount_path, timeout=0.2)
     assert succ == False
+    assert probe.call_count > 1
 
     # mount info updated
+    clock['now'] = 0.0
     local_proc_mounts = mount_alinas.Mount('mount_uuid_test:dns_test:/', '/mnt', 'type', '', '', '')
-    gmock = mocker.patch('mount_alinas.get_current_unas_mounts', return_value=[local_proc_mounts])
+    gmock.return_value = [local_proc_mounts]
     succ = mount_alinas.wait_mount_completed(mount_uuid, mount_path)
     assert succ == True
+
+
+def test_wait_mount_completed_tolerates_lock_startup_race(mocker):
+    mount_uuid = 'mount_uuid_test'
+    mount_path = 'dns_test:/'
+    mounted = mount_alinas.Mount(
+        'mount_uuid_test:dns_test:/', '/mnt', 'type', '', '', '')
+    mocker.patch('mount_alinas.check_fuse_protocol', return_value=True)
+    mocker.patch(
+        'mount_alinas.get_current_unas_mounts', side_effect=[[], [mounted]])
+    mocker.patch(
+        'mount_alinas.efc_process.probe_efc',
+        return_value=MagicMock(state=mount_alinas.efc_process.EFC_DEAD))
+    clock = {'now': 0.0}
+    mocker.patch(
+        'mount_alinas.time.monotonic', side_effect=lambda: clock['now'])
+    sleep = mocker.patch(
+        'mount_alinas.time.sleep',
+        side_effect=lambda seconds: clock.update(now=clock['now'] + seconds))
+
+    assert mount_alinas.wait_mount_completed(
+        mount_uuid, mount_path, timeout=3) is True
+    sleep.assert_called_once()
+
+
+def test_wait_mount_completed_stops_if_observed_owner_dies(mocker):
+    mount_uuid = 'mount_uuid_test'
+    mocker.patch('mount_alinas.get_current_unas_mounts', return_value=[])
+    mocker.patch(
+        'mount_alinas.efc_process.probe_efc',
+        side_effect=[
+            MagicMock(state=mount_alinas.efc_process.EFC_RUNNING),
+            MagicMock(state=mount_alinas.efc_process.EFC_DEAD),
+        ])
+    clock = {'now': 0.0}
+    mocker.patch(
+        'mount_alinas.time.monotonic', side_effect=lambda: clock['now'])
+    mocker.patch(
+        'mount_alinas.time.sleep',
+        side_effect=lambda seconds: clock.update(now=clock['now'] + seconds))
+
+    assert mount_alinas.wait_mount_completed(
+        mount_uuid, 'dns_test:/', timeout=120) is False
+    assert clock['now'] == pytest.approx(0.1)
+
+
+@pytest.mark.parametrize('state, expected', [
+    (mount_alinas.efc_process.EFC_RUNNING, True),
+    (mount_alinas.efc_process.EFC_ZOMBIE_LOCKED, False),
+    (mount_alinas.efc_process.EFC_DEAD, False),
+    (mount_alinas.efc_process.EFC_UNKNOWN, False),
+])
+def test_bindroot_requires_running_efc(mocker, state, expected):
+    mocker.patch(
+        'mount_alinas.efc_process.probe_efc',
+        return_value=MagicMock(state=state))
+
+    assert mount_alinas.is_bindroot_efc_running('uuid') is expected
 
 def test_check_unas_bindmount(mocker):
     gmock = mocker.patch('mount_alinas.get_current_unas_mounts', return_value=[])
@@ -251,7 +325,7 @@ def test_check_unas_bindmount(mocker):
     local_proc_mounts = mount_alinas.Mount('bindroot-xx:dns_test:/', mp, 'type', '', '', '')
     gmock = mocker.patch('mount_alinas.get_current_unas_mounts', return_value=[local_proc_mounts])
 
-    gmock = mocker.patch('mount_alinas.check_unas_process', return_value=[True])
+    gmock = mocker.patch('mount_alinas.is_bindroot_efc_running', return_value=True)
     gmock = mocker.patch('mount_alinas.check_unas_lock_available', return_value=[True])
     mount_point, uuid = mount_alinas.check_unas_bindmount(ctx)
     assert mount_point == mp
@@ -361,6 +435,79 @@ def test_mount_unas_upgrade(mocker, tmpdir):
     assert len(tmpdir.listdir()) == 4
 
 
+def test_run_mount_upgrade_waits_for_new_lock_owner(mocker):
+    old_owner = MagicMock(
+        state=mount_alinas.efc_process.EFC_RUNNING,
+        owner_pid=100,
+        proc_starttime=1000,
+        lock_dev=1,
+        lock_inode=2,
+        reason='old owner')
+    new_owner = MagicMock(
+        state=mount_alinas.efc_process.EFC_RUNNING,
+        owner_pid=101,
+        proc_starttime=1001,
+        lock_dev=1,
+        lock_inode=3,
+        reason='new owner')
+    mocker.patch(
+        'mount_alinas.load_unas_state_file',
+        return_value={'mountcmd': 'mount-cmd'})
+    mocker.patch('mount_alinas.get_unas_internal_info', return_value='info')
+    mocker.patch('mount_alinas.create_unas_mount_dir')
+    mocker.patch('mount_alinas.execute', return_value=0)
+    mocker.patch(
+        'mount_alinas.efc_process.probe_efc', return_value=old_owner)
+    readiness = mocker.patch(
+        'mount_alinas.efc_process.wait_efc_readiness',
+        return_value=new_owner)
+    mounted = mocker.patch(
+        'mount_alinas.wait_mount_completed', return_value=True)
+    add_cgroup = mocker.patch('mount_alinas.add_cgroup_limit')
+    ctx = mount_alinas.MountContext(
+        None, 'systemd', 'dns_name', 'fs_id', '/', '/mnt', None,
+        {'upgrade': None})
+
+    mount_alinas.run_mount_unas(
+        ctx, 'uuid', '/mnt', 'dns_name:/', True, True)
+
+    assert readiness.call_args[1]['previous_probe'] is old_owner
+    assert readiness.call_args[1]['timeout'] <= mount_alinas.UNAS_MOUNT_TIMEOUT
+    assert mounted.call_args[0][2] <= mount_alinas.UNAS_MOUNT_TIMEOUT
+    add_cgroup.assert_called_once_with(ctx, 'uuid', efc_pid=101)
+
+
+def test_run_mount_upgrade_rejects_unchanged_lock_owner(mocker):
+    old_owner = MagicMock(
+        state=mount_alinas.efc_process.EFC_RUNNING,
+        owner_pid=100,
+        proc_starttime=1000,
+        lock_dev=1,
+        lock_inode=2,
+        reason='old owner')
+    mocker.patch(
+        'mount_alinas.load_unas_state_file',
+        return_value={'mountcmd': 'mount-cmd'})
+    mocker.patch('mount_alinas.get_unas_internal_info', return_value='info')
+    mocker.patch('mount_alinas.create_unas_mount_dir')
+    mocker.patch('mount_alinas.execute', return_value=0)
+    mocker.patch(
+        'mount_alinas.efc_process.probe_efc', return_value=old_owner)
+    mocker.patch(
+        'mount_alinas.efc_process.wait_efc_readiness',
+        return_value=old_owner)
+    mounted = mocker.patch('mount_alinas.wait_mount_completed')
+    ctx = mount_alinas.MountContext(
+        None, 'systemd', 'dns_name', 'fs_id', '/', '/mnt', None,
+        {'upgrade': None})
+
+    with pytest.raises(SystemExit):
+        mount_alinas.run_mount_unas(
+            ctx, 'uuid', '/mnt', 'dns_name:/', True, True)
+
+    mounted.assert_not_called()
+
+
 class MockRunMountUnas(object):
     def __init__(self, mocker):
         self.proc_mounts = []
@@ -418,7 +565,7 @@ def test_mount_umount_unas_bind(mocker, tmpdir):
     mocker.patch('mount_alinas.do_bind_umount', mock_mount_unas.do_bind_umount)
     mocker.patch('mount_alinas.get_current_unas_mounts', mock_mount_unas.read_proc_mounts)
     mocker.patch('mount_alinas.load_unas_state_file', mock_mount_unas.load_unas_state_file)
-    mocker.patch('mount_alinas.check_unas_process', return_value=[True])
+    mocker.patch('mount_alinas.is_bindroot_efc_running', return_value=True)
     mocker.patch('mount_alinas.check_unas_lock_available', return_value=[True])
 
     mount_uuid = mount_alinas.BIND_ROOT_PREFIX + 'xxoo'

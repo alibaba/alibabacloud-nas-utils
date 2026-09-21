@@ -259,13 +259,15 @@ class RefreshDnsCommand(RestartCommand):
         nas_dns = state['nas_dns']
         need_resolve = False
 
+        mount_port = cpfs_nfs_common.get_mount_port_from_haproxy_config(state['config_file'])
+
         if not cpfs_nfs_common.cpfs_dns_contains_ip(nas_dns, old_primary_server):
             logging.warning('cpfs primary server:{} is shrunk, will resolve dns: {}'.format(old_primary_server, nas_dns))
             need_resolve = True
         else:
-            if not cpfs_nfs_common.is_server_ready(old_primary_server, 2049):
+            if not cpfs_nfs_common.is_server_ready(old_primary_server, mount_port):
                 logging.warning('cpfs primary server:{} is down, try backup server:{}'.format(old_primary_server, old_backup_server))
-                if not cpfs_nfs_common.is_server_ready(old_backup_server, 2049):
+                if not cpfs_nfs_common.is_server_ready(old_backup_server, mount_port):
                     logging.warning('both cpfs primary server:{} and backup server:{} are down'.format(old_primary_server, old_backup_server))
                     need_resolve = True
 
@@ -275,7 +277,7 @@ class RefreshDnsCommand(RestartCommand):
         # try resolve new server
         for _ in range(3):
             new_primary_server, new_backup_server = cpfs_nfs_common.resolve_cpfs_dns(nas_dns)
-            if cpfs_nfs_common.is_server_ready(new_primary_server, 2049):
+            if cpfs_nfs_common.is_server_ready(new_primary_server, mount_port):
                 find_new_server = True
                 break
 
@@ -637,10 +639,11 @@ class DnsRefresher(object):
         nas_dns = state['nas_dns']
         nas_ip = state['nas_ip']
         backup_ip = state['backup_ip']
-
-        primary_die = not cpfs_nfs_common.is_server_ready(nas_ip, 2049)
+        mount_port = cpfs_nfs_common.get_mount_port_from_haproxy_config(state['config_file'])
+        
+        primary_die = not cpfs_nfs_common.is_server_ready(nas_ip, mount_port)
         primary_shrink = not cpfs_nfs_common.cpfs_dns_contains_ip(nas_dns, nas_ip)
-        if primary_shrink or (primary_die and not cpfs_nfs_common.is_server_ready(backup_ip, 2049)):
+        if primary_shrink or (primary_die and not cpfs_nfs_common.is_server_ready(backup_ip, mount_port)):
             logging.warning('Old server has died, try to change dns to new server: local_id=%s, dns=%s, old_primary_server=%s, old_backup_server=%s', local_id, nas_dns, nas_ip, backup_ip)
             self._eventbus.append(RefreshDnsCommand(local_id, self._state_file_dir))
 
@@ -670,6 +673,274 @@ class DnsRefresher(object):
             worker.join()
 
 
+class ZombieSessionDetector(object):
+    """检测 HAProxy 僵尸 session 并触发重启
+
+    设计考量：
+    - 重启 HAProxy 后，所有 session（包括僵尸）都会被清理
+    - 重启间隔（默认 70 秒）确保不会频繁重启影响系统稳定性
+    - 重启时间记录在状态文件中（last_zombie_restart_time），watchdog 重启后也能恢复
+    """
+
+    def __init__(self, config, eventbus, watchdog, state_file_dir=STATE_FILE_DIR):
+        self._config = config
+        self._eventbus = eventbus
+        self._watchdog = watchdog
+        self._state_file_dir = state_file_dir
+
+        # 从配置读取参数
+        self._threshold_sec = config.getint(CONFIG_SECTION,
+            'zombie_session_threshold_sec', default=5, minvalue=1, maxvalue=60)
+        self._restart_interval_sec = config.getint(CONFIG_SECTION,
+            'zombie_session_restart_interval_sec', default=70, minvalue=10, maxvalue=300)
+
+        # 记录首次检测时间（内存中，重启后丢失没关系，下次检测会重新开始）
+        self._zombie_detected_time = {}  # {local_dns: first_detected_time}
+
+        self._worker = threading.Thread(target=self._run)
+        self._running = True
+
+    def detect_zombie_sessions(self, socket_path):
+        """
+        通过 HAProxy stats socket 检测僵尸 session
+
+        僵尸 session 特征:
+        - scf=[8,...] 前端 state=EST
+        - scb=[10,...] 后端 state=CLO
+        - exp= 空（无超时）
+
+        show sess 输出支持两种格式：
+
+        单行格式（新版本）：
+        0x7f0a8c02ebe0: proto=tcpv4 ... scf=[8,14200h,fd=40,rex=,wex=] scb=[10,34005h,fd=41,rex=,wex=] exp= rc=0 c_exp=
+
+        多行格式（旧版本）：
+        0x7f0a8c02ebe0: proto=tcpv4 src=...
+            scf=[8,14200h,fd=40,rex=,wex=]
+            scb=[10,34005h,fd=41,rex=,wex=]
+            exp=
+
+        需要解析两种格式，提取 scf_state、scb_state 和 exp 值判断是否为僵尸。
+        """
+        try:
+            output = self._query_stats_socket(socket_path)
+
+            zombie_count = 0
+            current_session = {}
+            session_id = None
+
+            for line in output.split('\n'):
+                line = line.strip()
+                if not line:
+                    continue
+
+                # 检测 session ID 行（以 0x 开头）
+                if line.startswith('0x') and ':' in line:
+                    # 新 session 开始，检查上一个 session
+                    if session_id and self._is_zombie_session(current_session):
+                        zombie_count += 1
+                    # 开始新 session
+                    session_id = line.split(':')[0]
+                    current_session = {}
+
+                    # 单行格式：检查行中是否已包含 scf/scb/exp 信息
+                    # 例如: scf=[8,14200h,fd=40,rex=,wex=] scb=[10,34005h,fd=41,rex=,wex=] exp=30s
+                    self._parse_session_fields(line, current_session)
+                    continue
+
+                # 多行格式：收集 session 信息
+                self._parse_session_fields(line, current_session)
+
+            # 检查最后一个 session
+            if session_id and self._is_zombie_session(current_session):
+                zombie_count += 1
+
+            return zombie_count
+        except Exception as e:
+            logging.warning('Failed to detect zombie sessions via %s: %s', socket_path, e)
+            return 0
+
+    def _query_stats_socket(self, socket_path, command='show sess\n', timeout=5):
+        """通过 AF_UNIX socket 直接向 HAProxy stats socket 发送命令并读取完整响应
+
+        使用 Python 原生 socket 通信，避免依赖外部工具（如 socat）。
+        HAProxy 在非交互模式下处理完单条命令后会主动关闭连接，
+        因此读取到 EOF 即表示响应完整。
+        """
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.settimeout(timeout)
+        try:
+            sock.connect(socket_path)
+            sock.sendall(command.encode('utf-8'))
+            chunks = []
+            while True:
+                data = sock.recv(4096)
+                if not data:
+                    break
+                chunks.append(data)
+            return b''.join(chunks).decode('utf-8', 'replace')
+        finally:
+            sock.close()
+
+    def _parse_session_fields(self, line, session_info):
+        """从行中解析 session 字段（兼容单行和多行格式）
+
+        单行格式示例：
+        0x7f0a8c02ebe0: proto=tcpv4 ... scf=[8,14200h,fd=40,rex=,wex=] scb=[10,34005h,fd=41,rex=,wex=] exp=30s rc=0
+
+        多行格式示例：
+        scf=[8,14200h,fd=40,rex=,wex=]
+        """
+        # 解析 scf=（可能在行首或行中）
+        if 'scf=[' in line:
+            start = line.find('scf=[')
+            end = line.find(']', start)
+            if start >= 0 and end > start:
+                field = line[start+4:end+1]  # scf=[...]
+                session_info['scf_state'] = self._parse_sc_state(field)
+                session_info['scf_line'] = field
+
+        # 解析 scb=（可能在行首或行中）
+        if 'scb=[' in line:
+            start = line.find('scb=[')
+            end = line.find(']', start)
+            if start >= 0 and end > start:
+                field = line[start+4:end+1]  # scb=[...]
+                session_info['scb_state'] = self._parse_sc_state(field)
+                session_info['scb_line'] = field
+
+        # 解析 exp=（可能在行首或行中）
+        # exp= 后面可能没有值（如 "exp=" 或 "exp= rc=0"）或有值（如 "exp=30s" 或 "exp=30s rc=0"）
+        # 判断方法：检查 exp= 后面的第一个字符，如果是空格或到行尾，就是空值
+        if 'exp=' in line:
+            start = line.find('exp=')
+            rest = line[start+4:]  # 取 exp= 后面的内容
+            # 检查第一个字符：空格或空字符串表示无超时值
+            if rest == '' or rest[0] == ' ':
+                session_info['exp_empty'] = True
+            else:
+                # 有值，如 exp=30s 或 exp=30s rc=0
+                session_info['exp_empty'] = False
+
+    def _parse_sc_state(self, line):
+        """解析 stconn 的 state 值
+
+        格式: scf=[8,14200h,fd=40,rex=,wex=]
+        第一个数字是 state (8=EST, 10=CLO)
+        """
+        try:
+            # 提取括号内容
+            start = line.find('[')
+            end = line.find(',')
+            if start >= 0 and end > start:
+                state_str = line[start+1:end]
+                return int(state_str)
+        except:
+            pass
+        return None
+
+    def _is_zombie_session(self, session_info):
+        """判断是否为僵尸 session
+
+        僵尸 session 条件:
+        - scf_state = 8 (EST)
+        - scb_state = 10 (CLO)
+        - exp_empty = True (无超时)
+
+        参考 HAProxy 源码 stconn-t.h:
+        - SC_ST_EST = 8 (Established)
+        - SC_ST_CLO = 10 (Closed)
+        """
+        scf_state = session_info.get('scf_state')
+        scb_state = session_info.get('scb_state')
+        exp_empty = session_info.get('exp_empty', False)
+
+        return scf_state == 8 and scb_state == 10 and exp_empty
+
+    def _run(self):
+        """每秒检测一次"""
+        logging.info('ZombieSessionDetector started: threshold=%s, restart_interval=%s',
+                     self._threshold_sec, self._restart_interval_sec)
+
+        while self._running:
+            try:
+                self._check_all_haproxy()
+            except Exception as e:
+                logging.exception('ZombieSessionDetector error: %s', e)
+
+            time.sleep(1)
+
+        logging.info('ZombieSessionDetector stopped')
+
+    def _check_all_haproxy(self):
+        """检查所有 HAProxy 实例
+
+        重启时间从状态文件读取（持久化），watchdog 重启后也能恢复
+        """
+        state_files = cpfs_nfs_common.get_state_files(self._state_file_dir)
+        current_time = time.time()
+
+        for local_dns, state_file in state_files.items():
+            state = self._watchdog.load_state_file(self._state_file_dir, state_file)
+            if not state:
+                continue
+
+            # 获取 stats socket 路径
+            socket_path = state.get('stats_socket')
+            if not socket_path:
+                logging.debug('No stats_socket in state for %s', local_dns)
+                continue
+
+            if not os.path.exists(socket_path):
+                logging.debug('Stats socket not found: %s', socket_path)
+                continue
+
+            # 检测僵尸 session
+            zombie_count = self.detect_zombie_sessions(socket_path)
+
+            if zombie_count > 0:
+                logging.warning('Detected %d zombie sessions for %s', zombie_count, local_dns)
+
+                # 记录首次检测时间
+                if local_dns not in self._zombie_detected_time:
+                    self._zombie_detected_time[local_dns] = current_time
+
+                # 检查是否满足重启条件
+                first_detected = self._zombie_detected_time[local_dns]
+                # 从状态文件读取上次重启时间（持久化，watchdog 重启后也能恢复）
+                last_restart = state.get('last_zombie_restart_time', 0)
+
+                if current_time - first_detected >= self._threshold_sec:
+                    logging.debug('Zombie session detected for %s for %ds', local_dns, current_time - first_detected)
+                    if current_time - last_restart >= self._restart_interval_sec:
+                        logging.warning('Triggering restart for %s due to zombie sessions (detected for %ds)',
+                                        local_dns, current_time - first_detected)
+                        # 把重启时间写入状态文件（持久化，watchdog 重启后也能恢复）
+                        state['last_zombie_restart_time'] = current_time
+                        cpfs_nfs_common.rewrite_state_file(state, self._state_file_dir, state_file)
+                        self._eventbus.append(RestartCommand(local_dns, self._state_file_dir))
+                        # 重置检测时间
+                        del self._zombie_detected_time[local_dns]
+                    else:
+                        logging.debug('Not triggering restart for %s due to zombie sessions (detected for %ds) because restart interval is not reached',
+                                      local_dns, current_time - first_detected)
+            else:
+                # 无僵尸 session，重置检测时间
+                if local_dns in self._zombie_detected_time:
+                    del self._zombie_detected_time[local_dns]
+
+    def start(self):
+        self._running = True
+        self._worker.start()
+
+    def stop(self):
+        self._running = False
+        worker = self._worker
+        self._worker = None
+        if worker:
+            worker.join()
+
+
 class Watchdog(object):
     def __init__(self, config, state_file_dir=STATE_FILE_DIR):
         self._config = config
@@ -679,6 +950,7 @@ class Watchdog(object):
         self._reload_requested = False
         self._detector = LiveDetector(self._config, self._eventbus, self, state_file_dir)
         self._refresher = DnsRefresher(self._config, self._eventbus, self, state_file_dir)
+        self._zombie_detector = ZombieSessionDetector(self._config, self._eventbus, self, state_file_dir)
         self._file_manager = cpfs_nfs_common.StateFileManager()
 
     @property
@@ -689,11 +961,13 @@ class Watchdog(object):
         signal(SIGHUP, self._on_sighup)
         self._detector.start()
         self._refresher.start()
+        self._zombie_detector.start()
 
     def _on_sighup(self, *args):
         self._reload_requested = True
 
     def stop(self):
+        self._zombie_detector.stop()
         self._refresher.stop()
         self._detector.stop()
 

@@ -28,19 +28,17 @@ def assert_result(file_path, val):
         lines = f.readlines()
         assert val in lines[0]
 
-def test_add_cgroup_limit(mocker):
-    PID = os.popen("ps -ef | grep 'make test$' | grep -vw grep | awk '{print $2}'").read()
-    mocker.patch('os.popen', return_value=PIDContainer(PID))
-    add_cgroup_limit('', UUID)
-    mocker.patch('os.popen', os.popen)
-
-    dir_path = os.path.join(CGROUP_DIR, UUID)
+def test_add_cgroup_limit(mocker, tmpdir):
+    pid = os.getpid()
+    mocker.patch('os.popen', return_value=PIDContainer(''))
+    dir_path = str(tmpdir.mkdir(UUID))
+    add_cgroup_limit('', UUID, str(tmpdir), efc_pid=pid)
 
     procs_path = os.path.join(dir_path, CGROUP_PROCS_FILE)
     limit_path = os.path.join(dir_path, CGROUP_LIMIT_FILE)
     swap_ctrl_path = os.path.join(dir_path, CGROUP_SWAP_CONTROL_FILE)
     oom_ctrl_path = os.path.join(dir_path, CGROUP_OOM_CONTROL_FILE)
     assert os.path.exists(dir_path)
-    assert_result(procs_path, PID)
+    assert_result(procs_path, str(pid))
     assert_result(swap_ctrl_path, '0')
     assert_result(oom_ctrl_path, '0')

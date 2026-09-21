@@ -35,6 +35,7 @@ mkdir -p ${BUILD_ROOT}/var/log/aliyun/cpfs
 mkdir -p ${BUILD_ROOT}/var/log/aliyun/alinas
 mkdir -p ${BUILD_ROOT}/opt/aliyun/cpfs
 mkdir -p ${BUILD_ROOT}/opt/aliyun/cpfs/tools
+mkdir -p ${BUILD_ROOT}/opt/aliyun/alinas
 mkdir -p ${BUILD_ROOT}/usr/local/nas-agent
 mkdir -p ${BUILD_ROOT}/etc/nas-agent
 
@@ -54,6 +55,8 @@ install -p -m 755 src/alinas/mount_alinas/umount.efc.sh ${BUILD_ROOT}/sbin/umoun
 install -p -m 755 src/alinas/mount_alinas/umount.efc.sh ${BUILD_ROOT}/sbin/umount.alifuse.aliyun-alinas-efc
 install -p -m 755 src/alinas/mount_alinas/umount.efc.sh ${BUILD_ROOT}/sbin/umount.fuse.aliyun-alinas-efc
 install -p -m 755 src/alinas/watchdog/__init__.py ${BUILD_ROOT}/usr/bin/aliyun-alinas-mount-watchdog
+install -p -m 644 src/alinas/efc_process.py ${BUILD_ROOT}/opt/aliyun/alinas/efc_process.py
+install -p -m 644 src/alinas/process_probe.py ${BUILD_ROOT}/opt/aliyun/alinas/process_probe.py
 install -p -m 755 src/cpfs/watchdog/__init__.py ${BUILD_ROOT}/usr/bin/aliyun-cpfs-mount-watchdog
 install -p -m 755 src/cpfs/cpfs_nfs_common/__init__.py ${BUILD_ROOT}/opt/aliyun/cpfs/cpfs_nfs_common.py
 install -p -m 755 src/cpfs/cpfs_nfs_tool/cpfsu.sh ${BUILD_ROOT}/usr/sbin/cpfsu

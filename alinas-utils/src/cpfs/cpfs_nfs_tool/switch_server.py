@@ -39,12 +39,18 @@ STATE_FILE_DIR = '/var/run/cpfs'
 LOCAL_DNS_PATTERN = re.compile('^(?P<mnt_id>[-0-9a-zA-Z]+).(?P<region>[-0-9a-zA-Z]+).cpfs.aliyuncs.com')
 IP_PATTERN = re.compile(r"^(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$")
 
-def get_haproxy_pid(local_dns):
+def get_haproxy_pid(local_dns, fatal=True):
     try:
-        cmd = ("ps -ef | grep haproxy | grep -vw grep | grep %s | awk '{print $2}'" % local_dns)
-        return subprocess.check_output(cmd, shell=True)
+        # Use pgrep instead of ps -ef | grep to avoid generating and piping
+        # the full process list, which can deadlock on busy systems.
+        pattern = 'haproxy.*%s' % re.escape(local_dns)
+        return subprocess.check_output(['pgrep', '-f', pattern])
     except:
-        fatal_error('Failed to get proxy pid: {0}'.format(local_dns)) 
+        if fatal:
+            fatal_error('Failed to get proxy pid: {0}'.format(local_dns))
+        else:
+            logging.warning('Failed to get proxy pid: {0}, continue'.format(local_dns))
+            return None
 
 
 def wait_for_haproxy_ready(local_dns, timeout=30):
@@ -52,8 +58,13 @@ def wait_for_haproxy_ready(local_dns, timeout=30):
 
     sleep_time = 0.001
     while time.time() < deadline:
-        try: 
-            pid_out = get_haproxy_pid(local_dns)
+        pid_out = get_haproxy_pid(local_dns, fatal=False)
+        if pid_out is None:
+            time.sleep(sleep_time)
+            sleep_time *= 2
+            logging.info('wait time: {}'.format(sleep_time))
+            continue
+        try:
             pid = int(pid_out.decode('utf-8').split('\n')[0])
             if cpfs_nfs_common.is_hp_running(pid, local_dns):
                 return 
@@ -88,6 +99,8 @@ def update_alicpfs_server(local_dns, old_primary_server, old_backup_server, new_
     else:
         logging.warning('No mount found for "%s"', local_dns)
 
+
+
 def get_haproxy_server(local_dns, state_file_dir=STATE_FILE_DIR):
     primary_server = ''
     backup_server = ''
@@ -96,13 +109,12 @@ def get_haproxy_server(local_dns, state_file_dir=STATE_FILE_DIR):
         with open(haproxy_config_file, 'r') as f:
             for line in f:
                 if 'cpfs_primary' in line:
-                    primary_server = line.split(':2049')[0].split('cpfs_primary ')[1].strip()
+                    primary_server = cpfs_nfs_common.parse_haproxy_server_host(line, 'cpfs_primary') or primary_server
                 if 'cpfs_backup' in line:
-                    backup_server = line.split(':2049')[0].split('cpfs_backup ')[1].strip()
+                    backup_server = cpfs_nfs_common.parse_haproxy_server_host(line, 'cpfs_backup') or backup_server
         return primary_server, backup_server
     except:
-        fatal_error('get haproxy server failed, domain is:{}'.format(local_dns))
-                    
+        fatal_error('Failed to get haproxy servers from config: {}'.format(haproxy_config_file))
 
 def change_alicpfs_server(local_dns):
     nfs_mounts = cpfs_nfs_common.get_current_local_nfs_mounts()
@@ -150,17 +162,19 @@ def check_arguments(args):
 
     check_server_in_proxy_config(haproxy_config_file, 'cpfs_backup', args.old_backup_server) 
 
+    mount_port = cpfs_nfs_common.get_mount_port_from_haproxy_config(haproxy_config_file)
+
     match = IP_PATTERN.match(args.new_primary_server)
     if not match:
         fatal_error('Invalid new primary server: %s' % args.new_primary_server)
-    ret = cpfs_nfs_common.is_server_ready(args.new_primary_server, 2049)
+    ret = cpfs_nfs_common.is_server_ready(args.new_primary_server, mount_port)
     if not ret:
         fatal_error('Invalid new primary server: %s' % args.new_primary_server)
 
     match = IP_PATTERN.match(args.new_backup_server)
     if not match:
         fatal_error('Invalid new backup server: %s' % args.new_backup_server)
-    ret = cpfs_nfs_common.is_server_ready(args.new_backup_server, 2049)
+    ret = cpfs_nfs_common.is_server_ready(args.new_backup_server, mount_port)
     if not ret:
         fatal_error('Invalid new backup server: %s' % args.new_backup_server)
 

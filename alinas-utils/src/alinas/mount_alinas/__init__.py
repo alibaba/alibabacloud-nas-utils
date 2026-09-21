@@ -59,6 +59,16 @@ from logging.handlers import RotatingFileHandler
 from logging import StreamHandler
 from threading import Timer
 
+try:
+    import efc_process
+    import process_probe
+except ImportError:
+    ALINAS_PYTHON_DIR = '/opt/aliyun/alinas'
+    if ALINAS_PYTHON_DIR not in sys.path:
+        sys.path.insert(0, ALINAS_PYTHON_DIR)
+    import efc_process
+    import process_probe
+
 
 try:
     from configparser import ConfigParser, NoOptionError, NoSectionError
@@ -213,7 +223,6 @@ OLD_SESSMGR_BIN_NAME = 'aliyun-alinas-eac-sessmgrd'
 SESSMGR_BIN_PATH = '/usr/bin/%s' % SESSMGR_BIN_NAME
 EFC_SOCKET_SUFFIX = 'efc.sock'
 EAC_SOCKET_SUFFIX = 'eac.sock'
-EFC_LOCK_SUFFIX = 'efc.lock'
 EFC_MINIMUM_SUPPORTED_KERNEL_VERSIONS_CONFIG = '/etc/aliyun/alinas/aliyun-alinas-efc-minimum-supported-kernel-versions.json'
 
 VFUSE_UTIL_BIN_NAME = 'aliyun-alinas-efc-vsutils'
@@ -234,6 +243,10 @@ UNAS_BIN_PATH = '/usr/bin/%s' % UNAS_BIN_NAME
 UNAS_LOG_CONF_TEMPLATE_PATH = '/etc/aliyun/alinas/log_conf.efc.json'
 VSC_LOG_CONF_TEMPLATE_PATH = '/etc/aliyun/alinas/log_conf.vsc.json'
 UNAS_LOG_DIR = '/var/log/aliyun/alinas'
+
+# try get node id through file or env
+LINGJUN_CONFIG_PATH = '/etc/eflo_config/lingjun_config' # config path, in single tenant
+NODE_ID_ENV_VAR = 'LINGJUN_NODE_NAME' #env var, in rund
 
 UNAS_MOUNT_LOCK_TIMEOOUT = 20
 UNAS_MOUNT_TIMEOUT = 120
@@ -280,12 +293,16 @@ ALINAS_ONLY_OPTIONS = [
     'no_kernel_permission',
     'auto_fallback_nfs',
     'accesspoint',
+    'access_key_id',
+    'access_key_secret',
+    'security_token',
     'ram',
     'ram_config_file',
     'tls_ciphers',
     'no_add_cgroup',
     UNAS_APP_NAME,
-    BIND_TAG
+    BIND_TAG,
+    'numa_node',
 ]
 
 UNSUPPORTED_OPTIONS = [
@@ -325,12 +342,9 @@ CENTOS8_RELEASE_NAME = 'CentOS Linux release 8'
 ALICLOUD_LINUX3_RELEASE_NAME = 'Alibaba Cloud Linux release 3 (Soaring Falcon)'
 ALICLOUD_LINUX3_LIFSEA_RELEASE_NAME = 'Alibaba Cloud Linux Lifsea (ContainerOS) release 3'
 SKIP_NO_LIBWRAP_RELEASES = [RHEL8_RELEASE_NAME, CENTOS8_RELEASE_NAME, ALICLOUD_LINUX3_RELEASE_NAME, ALICLOUD_LINUX3_LIFSEA_RELEASE_NAME]
-SKIP_NO_LIBWRAP_RELEASE_IDS = {'alinux' : '3', 'alinux': '4'}
+SKIP_NO_LIBWRAP_RELEASE_IDS = {'alinux': {'3', '4'}}
 
-PS_CMD = 'ps -eww -o pid,cmd,args '
-#    PID CMD                         COMMAND
-#  14190 /usr/bin/aliyun-alinas-efc- /usr/bin/aliyun-alinas-efc-sessmgrd --apsara_log_conf_path=/var/log/aliyun/alinas/log_conf.sessmgr.json
-#  24309 /usr/bin/aliyun-alinas-efc  /usr/bin/aliyun-alinas-efc -o server=9ff4d4bbb1-tfj1.cn-zhangjiakou.nas.aliyuncs.com:/ -o mountpoint=/mnt/myc -o rw,protocol=efc,fstype=nas,net=tcp,fd_store=sessmgrd,client_owner=nas-test011122132022.ea134_a9voK4bB_1734320510421840,default_permissions,allow_other --unas_CoreFileSizeLimitSize=-1 -o mount_uuid=a9voK4bB --apsara_log_conf_path=/var/log/aliyun/alinas/efc-a9voK4bB/log_conf.efc.json
+PROCESS_STARTTIME = 'pid_starttime'
 
 
 MountContext = namedtuple('MountContext', ('config', 'init_system', 'dns', 'fs_id', 'path', 'mountpoint', 'credentials', 'options'))
@@ -558,7 +572,7 @@ def support_libwrap_config():
         return False
 
     system_id, system_version_id = get_system_release_id()
-    if system_id in SKIP_NO_LIBWRAP_RELEASE_IDS and SKIP_NO_LIBWRAP_RELEASE_IDS[system_id] == system_version_id:
+    if system_id in SKIP_NO_LIBWRAP_RELEASE_IDS and system_version_id in SKIP_NO_LIBWRAP_RELEASE_IDS[system_id]:
         return False
 
     return True
@@ -680,6 +694,11 @@ def write_state_file(local_dns, ctx, tunnel_pid, command, config_file, files, st
         'timeo': get_ali_timeout(ctx.options),
         BIND_TAG: bind_tag
     }
+    try:
+        identity = process_probe.read_process_identity(tunnel_pid)
+        state[PROCESS_STARTTIME] = identity.starttime
+    except (IOError, OSError, ValueError):
+        pass
     if cert_details:
         state.update(cert_details)
     if uuid:
@@ -924,39 +943,59 @@ def unlock_file(fd):
 
 def init_mount_stats():
     stat_timestamps.clear()
-    record_mount_stat('total_start_time')
+    record_mount_stat('mount_start')
 
 def record_mount_stat(key):
     stat_timestamps[key] = time.time()
+    logging.warning('[mount_stat] %s', key)
+
+def record_call(func, *args, **kwargs):
+    """Call func with automatic latency recording."""
+    name = func.__name__
+    record_mount_stat(name + '_start')
+    result = func(*args, **kwargs)
+    record_mount_stat(name + '_end')
+    return result
+
+def calc_step_latency(name, end_key=None):
+    """Calculate latency in ms. Single arg auto-appends _start/_end."""
+    if end_key is None:
+        start_key, end_key = name + '_start', name + '_end'
+    else:
+        start_key = name
+    start = stat_timestamps.get(start_key, 0)
+    end = stat_timestamps.get(end_key, 0)
+    return (end - start) * 1000 if start and end else 0
 
 def complete_mount_stats(ctx):
     """Calculate and log mount delay statistics (milliseconds)."""
-    total_start_time = stat_timestamps.get('total_start_time', 0)
-    stunnel_start_time = stat_timestamps.get('stunnel_start_time', 0)
-    proxy_ready_time = stat_timestamps.get('proxy_ready_time', 0)
-    nfs_mount_end_time = stat_timestamps.get('nfs_mount_end_time', 0)
-    if not nfs_mount_end_time:
+    if not stat_timestamps.get('nfs_mount_end'):
         return
-    
-    preparation_delay = (stunnel_start_time - total_start_time) * 1000
-    stunnel_startup_delay = (proxy_ready_time - stunnel_start_time) * 1000
-    nfs_mount_delay = (nfs_mount_end_time - proxy_ready_time) * 1000
-    total_delay = (nfs_mount_end_time - total_start_time) * 1000
-    
+
     logging.info('mount_latency_statistics:\t'
                  'protocol: tls\t'
                  'remote_mnt: %s\t'
                  'local_dir: %s\t'
+                 'lock_alinas_latency: %.3f\t'
+                 'choose_proxy_addr_latency: %.3f\t'
+                 'resolve_dns_latency: %.3f\t'
+                 'get_clientaddr_latency: %.3f\t'
+                 'create_certificate_latency: %.3f\t'
                  'preparation_latency: %.3f\t'
                  'stunnel_startup_latency: %.3f\t'
                  'nfs_mount_latency: %.3f\t'
                  'total_latency: %.3f',
                  ctx.dns,
                  ctx.mountpoint,
-                 preparation_delay,
-                 stunnel_startup_delay,
-                 nfs_mount_delay,
-                 total_delay)
+                 calc_step_latency('lock_alinas'),
+                 calc_step_latency('choose_proxy_addr'),
+                 calc_step_latency('resolve_dns'),
+                 calc_step_latency('get_clientaddr'),
+                 calc_step_latency('create_certificate'),
+                 calc_step_latency('mount_start', 'stunnel_start'),
+                 calc_step_latency('stunnel_start', 'proxy_ready'),
+                 calc_step_latency('proxy_ready', 'nfs_mount_end'),
+                 calc_step_latency('mount_start', 'nfs_mount_end'))
 
     stat_timestamps.clear()
 
@@ -1013,14 +1052,16 @@ def start_tx(tx_name, ctx, state_file_dir=STATE_FILE_DIR):
     if not os.path.exists(state_file_dir):
         os.makedirs(state_file_dir, exist_ok=True)
 
+    record_mount_stat('lock_alinas_start')
     with lock_alinas(state_file_dir) as _:
-        host, port = choose_proxy_addr(ctx.config, state_file_dir)
+        record_mount_stat('lock_alinas_end')
+        host, port = record_call(choose_proxy_addr, ctx.config, state_file_dir)
         local_dns, uuid = compose_local_dns_with_uuid(ctx.fs_id, host, 'tls' in ctx.options)
-        nas_ip = resolve_dns(ctx.dns)
+        nas_ip = record_call(resolve_dns, ctx.dns)
         ctx.options['proxy'] = host
         ctx.options['proxy_port'] = port
         ctx.options['nas_ip'] = nas_ip
-        ctx.options['clientaddr'] = get_clientaddr(ctx.dns, nas_ip)
+        ctx.options['clientaddr'] = record_call(get_clientaddr, ctx.dns, nas_ip)
 
         tx = Tx(local_dns)
         yield tx
@@ -1049,9 +1090,9 @@ def start_tx(tx_name, ctx, state_file_dir=STATE_FILE_DIR):
                 with lock_dns(state_file_dir):
                     setup_local_dns(local_dns, host, ctx.options)
                 wait_for_proxy_ready(local_dns, host, port)
-                record_mount_stat('proxy_ready_time')
+                record_mount_stat('proxy_ready')
                 mount_nfs_directly(local_dns, ctx.path, ctx.mountpoint, ctx.options)
-                record_mount_stat('nfs_mount_end_time')
+                record_mount_stat('nfs_mount_end')
             except:
                 tx.process.kill()
                 raise
@@ -1078,6 +1119,13 @@ def get_alinas_security_credentials(options):
     credentials['AccessKeyId'] = ram_config.get(RAM_CONFIG_SECTION, 'accessKeyID', None)
     credentials['AccessKeySecret'] = ram_config.get(RAM_CONFIG_SECTION, 'accessKeySecret', None)
     credentials['SecurityToken'] = ram_config.get(RAM_CONFIG_SECTION, 'securityToken', None)
+
+    if 'access_key_id' in options:
+        credentials['AccessKeyId'] = options['access_key_id']
+    if 'access_key_secret' in options:
+        credentials['AccessKeySecret'] = options['access_key_secret']
+    if 'security_token' in options:
+        credentials['SecurityToken'] = options['security_token']
 
     if not credentials.get('AccessKeyId', None) or not credentials.get('AccessKeySecret', None):
         fatal_error("access_key_id or access_key_secret not found")
@@ -1613,7 +1661,8 @@ def bootstrap_tls(config, fs_id, mountpoint, local_dns, dns_name, security_crede
     # common name for certificate signing request is max 64 characters
     cert_details["commonName"] = socket.gethostname()[0:64]
     cert_details["region"] = region
-    cert_details["certificateCreationTime"] = create_certificate(
+    cert_details["certificateCreationTime"] = record_call(
+            create_certificate,
             config,
             cert_details["mountStateDir"],
             cert_details["commonName"],
@@ -1646,7 +1695,7 @@ def bootstrap_tls(config, fs_id, mountpoint, local_dns, dns_name, security_crede
     # launch the tunnel in a process group so if it has any child processes, they can be killed easily
     # by the mount watchdog
     logging.info('Starting TLS tunnel: "%s"', ' '.join(tunnel_args))
-    record_mount_stat('stunnel_start_time')
+    record_mount_stat('stunnel_start')
     tunnel_proc = subprocess.Popen(tunnel_args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, preexec_fn=os.setsid)
     logging.info('Started TLS tunnel, pid: %d', tunnel_proc.pid)
 
@@ -1674,6 +1723,31 @@ def serialize_options(options):
     nfs_options = [to_nfs_option(k, v) for k, v in options.items() if k not in ALINAS_ONLY_OPTIONS]
 
     return ','.join(nfs_options)
+
+
+def _mask_value_for_log(value, keep=0):
+    """Mask a sensitive value, optionally keeping the first `keep` characters."""
+    if value is None:
+        return value
+    s = str(value)
+    if keep <= 0 or not s:
+        return '***'
+    return s[:keep] + '***'
+
+def sanitize_options_for_log(options):
+    """Return a shallow copy of options with sensitive credential values masked for logging."""
+    sensitive_keys = {
+        'access_key_id': 10,
+        'access_key_secret': 0,
+        'security_token': 0,
+    }
+    sanitized = {}
+    for k, v in options.items():
+        if k in sensitive_keys:
+            sanitized[k] = _mask_value_for_log(v, sensitive_keys[k])
+        else:
+            sanitized[k] = v
+    return sanitized
 
 
 def get_nfs_mount_options(options):
@@ -1764,7 +1838,7 @@ def mount_tls(ctx):
                  ctx.dns,
                  ctx.path,
                  ctx.mountpoint,
-                 ctx.options)
+                 sanitize_options_for_log(ctx.options))
 
     init_mount_stats()
     with start_tx('Stunnel', ctx) as tx:
@@ -1841,24 +1915,11 @@ def exec_cmd_in_subprocess(cmd, **kwargs):
 
 
 def check_sessmgr_alive():
-    regex_sessmgr = SESSMGR_BIN_NAME
     try:
-        cmd = PS_CMD + "| grep sessmgr"
-        info = os.popen(cmd).read()
-        return regex_sessmgr in info
+        return bool(process_probe.find_processes_by_exe((SESSMGR_BIN_PATH,)))
 
     except Exception as e:
         fatal_error('Fail to check sessmgr alive, exception msg:%s', str(e))
-
-def check_watchdog_alive():
-    regex_watchdog = WATCHDOG_BIN_NAME
-    try:
-        cmd = PS_CMD + "| grep watchdog"
-        info = os.popen(cmd).read()
-        return regex_watchdog in info
-
-    except Exception as e:
-        fatal_error('Fail to check watchdog alive, exception msg:%s', str(e))
 
 def get_unas_mount_file_path(mount_uuid, global_dir=UNAS_LOG_DIR):
     dir_path = os.path.join(global_dir, 'efc-' + mount_uuid)
@@ -2250,22 +2311,56 @@ def check_fuse_protocol():
     return True
 
 def wait_mount_completed(mount_uuid, mount_path, timeout=3):
-    deadline = time.time() + timeout
+    start_time = time.monotonic()
+    deadline = start_time + max(0.0, timeout)
+    readiness_deadline = min(
+        deadline, start_time + efc_process.EFC_READINESS_TIMEOUT)
     local_mount_dns = mount_uuid + ':' + mount_path
-    sleep_time = 0.1
+    sleep_time = efc_process.EFC_READINESS_POLL_INTERVAL
+    observed_running = False
     try:
-        while time.time() < deadline:
+        while True:
             unas_mounts = get_current_unas_mounts(MOUNT_TYPE_EFC)
             for m in unas_mounts:
                 if m.server == local_mount_dns and check_fuse_protocol():
                     return True
 
-            if not check_unas_process(mount_uuid) and \
-                not os.path.exists('%s/%s.%s' % (EFC_WORKSPACE_DIR, mount_uuid, EFC_LOCK_SUFFIX)):
-                logging.error('{0}, uuid:{1} dead'.format(UNAS_BIN_PATH, mount_uuid))
+            # Always check the mount once, even if earlier stages used the
+            # whole budget or the last sleep reached the deadline.
+            if time.monotonic() >= deadline:
                 break
 
-            time.sleep(sleep_time)
+            probe = efc_process.probe_efc(mount_uuid, EFC_WORKSPACE_DIR)
+            now = time.monotonic()
+            if probe.state == efc_process.EFC_RUNNING:
+                observed_running = True
+            elif probe.state == efc_process.EFC_DEAD:
+                # The mount command can return just before EFC acquires its
+                # UUID lock. Retry that startup race briefly, but stop quickly
+                # if a previously observed owner disappears.
+                if observed_running or now >= readiness_deadline:
+                    logging.error(
+                        '{0}, uuid:{1} dead'.format(UNAS_BIN_PATH, mount_uuid))
+                    break
+            elif probe.state == efc_process.EFC_ZOMBIE_LOCKED:
+                logging.error(
+                    '{0}, uuid:{1} zombie owns lock, owner:{2}'.format(
+                        UNAS_BIN_PATH, mount_uuid, probe.owner_pid))
+                break
+            elif probe.state == efc_process.EFC_LOCK_CONFLICT:
+                logging.error(
+                    '{0}, uuid:{1} lock conflict, owner:{2}, reason:{3}'.format(
+                        UNAS_BIN_PATH, mount_uuid, probe.owner_pid, probe.reason))
+                break
+            elif not observed_running and now >= readiness_deadline:
+                logging.error(
+                    '{0}, uuid:{1} readiness unknown, reason:{2}'.format(
+                        UNAS_BIN_PATH, mount_uuid, probe.reason))
+                break
+
+            remaining = deadline - time.monotonic()
+            if remaining > 0:
+                time.sleep(min(sleep_time, remaining))
 
         return False
 
@@ -2315,6 +2410,8 @@ def serialize_unas_options(options, mount_uuid):
             unas_flags.append('%s=%s' % (flag_name, str(v)))
         elif k == 'client_owner':
             client_owner_param = str(v)
+        elif k == 'node_id':
+            pass
         else:
             unas_options.append('%s=%s' % (str(k), str(v)))
 
@@ -2322,22 +2419,38 @@ def serialize_unas_options(options, mount_uuid):
     owner_str = client_owner_param + '_' + unique_str
     unas_options.append('%s=%s' % ('client_owner', owner_str))
 
+    node_id = options.get('node_id') or get_node_id()
+    if node_id:
+        unas_options.append('node_id=%s' % node_id)
+
     return ','.join(unas_options), ' '.join(unas_flags)
 
 def precheck_unas_flag(fs_type, mount_path, options):
+    """Precheck backend capabilities. Returns the raw config map (or {})."""
     if options.get('flagcheck') == 'none':
         logging.info('Not flag check')
-        return
-    if fs_type == 'cpfs':
-        if options.get('g_lease_Enable') == 'false':
-            return
-        backend_config_map = precheck_fs_config(mount_path, options)
+        return {}
+    net = options.get('net', '')
+    # cpfs: check whether the backend supports lease
+    # vsc:  check whether the backend is CIPU (blkpt zerocopy)
+    check_lease = fs_type == 'cpfs' and options.get('g_lease_Enable') != 'false'
+    check_vsc = net == 'vsc'
+    if not (check_lease or check_vsc):
+        return {}
+    backend_config_map = precheck_fs_config(mount_path, options)
+    if check_lease:
         options['g_lease_Enable'] = 'true' if backend_config_map.get('lease_enabled') else 'false'
+    if check_vsc:
+        if backend_config_map.get('blkpt_zerocopy'):
+            logging.info('precheck: blkpt_zerocopy enabled, backend is CIPU')
+        if backend_config_map.get('registered_zerocopy'):
+            logging.info('precheck: registered_zerocopy enabled')
+    return backend_config_map
 
 def gen_unas_mount_cmd(uuid, mount_point, mount_path, options, log_path, vsc_log_path):
     mount_cmd = UNAS_BIN_PATH
     fs_type = options.get('fstype')
-    precheck_unas_flag(fs_type, mount_path, options)
+    precheck_config = precheck_unas_flag(fs_type, mount_path, options)
     mount_uuid = "-o mount_uuid=%s" % uuid
     mount_point = "-o mountpoint=%s" % mount_point
     mount_path = "-o server=%s" % (mount_path)
@@ -2350,6 +2463,24 @@ def gen_unas_mount_cmd(uuid, mount_point, mount_path, options, log_path, vsc_log
     vsc_log_path = "--vsc_log_conf_path=%s" % vsc_log_path if get_efc_run_mode(options) == "efc_vsc_cpfs" else ""
 
     mount_cmd = ' '.join([mount_cmd, mount_path, mount_point, all_options, unas_flags, mount_uuid, log_path, vsc_log_path])
+
+    numactl_path = shutil.which('numactl')
+    if numactl_path:
+        numa_node = options.get('numa_node')
+        if numa_node is None:
+            net = options.get('net', '')
+            if net == 'vsc' and precheck_config.get('blkpt_zerocopy') and os.path.isdir('/sys/devices/system/node/node1'):
+                numa_node = '1'
+                logging.info('vsc+blkpt_zerocopy detected, auto selecting numa_node=1')
+        if numa_node is not None:
+            logging.info('numactl found at %s, binding to numa node %s', numactl_path, numa_node)
+            mount_cmd = 'numactl --cpunodebind=%s --membind=%s %s' % (numa_node, numa_node, mount_cmd)
+        else:
+            logging.info('numactl found at %s, prepending "numactl --interleave=all" to mount command', numactl_path)
+            mount_cmd = 'numactl --interleave=all ' + mount_cmd
+    else:
+        logging.info('numactl not found on the system, proceeding without numactl prefix')
+
     logging.debug('Executing: %s', mount_cmd)
     return mount_cmd
 
@@ -2437,13 +2568,9 @@ def gen_tls_local_dns_with_uuid(fs_id, ip):
     except Exception as e:
         fatal_error('Fail to gen tls local dns %s' % (str(e)))
 
-def check_unas_process(mount_uuid):
-    ps_cmd = PS_CMD + "| grep efc"
-    ps_info = os.popen(ps_cmd).read()
-    regex_uuid = 'mount_uuid=%s' % mount_uuid
-    if ps_info.find(regex_uuid) != -1:
-        return True
-    return False
+def is_bindroot_efc_running(mount_uuid):
+    probe = efc_process.probe_efc(mount_uuid, EFC_WORKSPACE_DIR)
+    return probe.state == efc_process.EFC_RUNNING
 
 def check_unas_lock_available(mount_uuid):
     state_file = unas_state_file_name(mount_uuid)
@@ -2502,7 +2629,7 @@ def double_check_unas_bindmount(ctx, bind_mountpoint, bind_mount_uuid):
                 if not check_mount_options_match(m, ctx):
                     logging.info('bind mount options mismatch, uuid:%s path:%s mountpoint:%s' % (mount_uuid, path, m.mountpoint))
                     continue
-                if not check_unas_process(mount_uuid):
+                if not is_bindroot_efc_running(mount_uuid):
                     logging.error('bind mount root process not exist, uuid:%s path:%s mountpoint:%s' % (mount_uuid, path, m.mountpoint))
                     continue
                 if not check_unas_lock_available(mount_uuid):
@@ -2548,7 +2675,7 @@ def check_unas_bindmount(ctx):
                 if not check_mount_options_match(m, ctx):
                     logging.info('bind mount options mismatch, uuid:%s path:%s mountpoint:%s' % (mount_uuid, path, m.mountpoint))
                     continue
-                if not check_unas_process(mount_uuid):
+                if not is_bindroot_efc_running(mount_uuid):
                     logging.error('bind mount root process not exist, uuid:%s path:%s mountpoint:%s' % (mount_uuid, path, m.mountpoint))
                     continue
                 if not check_unas_lock_available(mount_uuid):
@@ -2700,6 +2827,8 @@ def precheck_fs_config(mount_path, options):
         fatal_error('Failed to get precheckconfig, cmd:%s, errcode:%s, stdmsg:%s, errmsg:%s' % (cmd, errcode, stdmsg, errmsg))
     logging.info("precheck_fs_config cmd:%s, stdmsg:%s" % (cmd, stdmsg))
     config_map['lease_enabled'] = 'lease_enabled:true' in stdmsg
+    config_map['registered_zerocopy'] = 'registered_zerocopy:true' in stdmsg
+    config_map['blkpt_zerocopy'] = 'blkpt_zerocopy:true' in stdmsg
     return config_map
 
 def get_mount_err_log(uuid):
@@ -2742,6 +2871,7 @@ def get_unas_internal_info(mountpoint):
 
 def run_mount_unas(ctx, mount_uuid, mount_point, mount_path, is_upgrade, sessmgr_required):
     try:
+        pre_upgrade_probe = None
         if is_upgrade:
             state_file = unas_state_file_name(mount_uuid)
             state = load_unas_state_file(STATE_FILE_DIR, state_file)
@@ -2764,15 +2894,73 @@ def run_mount_unas(ctx, mount_uuid, mount_point, mount_path, is_upgrade, sessmgr
 
         # create mount dir(unas log)
         create_unas_mount_dir(ctx.options, mount_uuid)
-        errcode = execute(mount_cmd, UNAS_MOUNT_TIMEOUT)
+        operation_deadline = time.monotonic() + UNAS_MOUNT_TIMEOUT
+        if is_upgrade:
+            # Only retry an inconclusive upgrade preflight. DEAD is already
+            # allowed here; unlike post-start readiness, do not wait for it.
+            probe_deadline = min(
+                operation_deadline,
+                time.monotonic() + efc_process.EFC_READINESS_TIMEOUT)
+            pre_upgrade_probe = efc_process.probe_efc(
+                mount_uuid, EFC_WORKSPACE_DIR)
+            while pre_upgrade_probe.state == efc_process.EFC_UNKNOWN:
+                remaining = probe_deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                time.sleep(min(efc_process.EFC_READINESS_POLL_INTERVAL, remaining))
+                pre_upgrade_probe = efc_process.probe_efc(
+                    mount_uuid, EFC_WORKSPACE_DIR)
+            logging.info(
+                'EFC owner before upgrade, uuid:%s state:%s pid:%s reason:%s',
+                mount_uuid, pre_upgrade_probe.state,
+                pre_upgrade_probe.owner_pid, pre_upgrade_probe.reason)
+            if pre_upgrade_probe.state not in (
+                    efc_process.EFC_RUNNING, efc_process.EFC_DEAD):
+                # Upgrades historically use the same failure prefix as mounts;
+                # preserve it for log alarms, with new diagnostics in the tail.
+                fatal_error(
+                    'Fail to mount %s:%s:%s [operation:upgrade, current EFC state is unsafe, '
+                    'state:%s reason:%s]' % (
+                        UNAS_APP_NAME, mount_uuid, mount_path,
+                        pre_upgrade_probe.state, pre_upgrade_probe.reason))
+        command_timeout = max(0.0, operation_deadline - time.monotonic())
+        errcode = execute(mount_cmd, command_timeout)
 
         if errcode == 0:
-            mounted = wait_mount_completed(mount_uuid, mount_path, UNAS_MOUNT_TIMEOUT)
+            post_probe = None
+            if is_upgrade:
+                readiness_timeout = max(
+                    0.0, operation_deadline - time.monotonic())
+                post_probe = efc_process.wait_efc_readiness(
+                    mount_uuid,
+                    timeout=readiness_timeout,
+                    workspace_dir=EFC_WORKSPACE_DIR,
+                    previous_probe=pre_upgrade_probe,
+                )
+                owner_changed = (
+                    pre_upgrade_probe.state != efc_process.EFC_RUNNING
+                    or not efc_process.same_lock_identity(
+                        pre_upgrade_probe, post_probe)
+                )
+                if (post_probe.state != efc_process.EFC_RUNNING
+                        or not owner_changed):
+                    fatal_error(
+                        'Fail to mount %s:%s:%s [operation:upgrade, EFC is not ready, '
+                        'state:%s reason:%s]' % (
+                            UNAS_APP_NAME, mount_uuid, mount_path,
+                            post_probe.state, post_probe.reason))
+
+            mount_timeout = max(0.0, operation_deadline - time.monotonic())
+            mounted = wait_mount_completed(
+                mount_uuid, mount_path, mount_timeout)
             if mounted:
-                info = 'mount'
-                if 'upgrade' in ctx.options:
-                    info = 'upgrade'
-                add_cgroup_limit(ctx, mount_uuid)
+                info = 'upgrade' if is_upgrade else 'mount'
+                if post_probe is None:
+                    post_probe = efc_process.probe_efc(
+                        mount_uuid, EFC_WORKSPACE_DIR)
+                efc_pid = (post_probe.owner_pid
+                           if post_probe.state == efc_process.EFC_RUNNING else None)
+                add_cgroup_limit(ctx, mount_uuid, efc_pid=efc_pid)
                 logging.info('Successfully %s %s at %s', info, mount_path, mount_point)
                 print("%s %s:%s successfully" % (info, UNAS_APP_NAME, mount_path))
             else:
@@ -2842,7 +3030,7 @@ def get_unas_file_open_max_size(ctx):
         f.close()
     return file_max * UNAS_SHM_FILE_SIZE
 
-def add_cgroup_limit(ctx, mount_uuid, cgroup_dir=CGROUP_DIR):
+def add_cgroup_limit(ctx, mount_uuid, cgroup_dir=CGROUP_DIR, efc_pid=None):
     try:
         if 'no_add_cgroup' in ctx.options:
             logging.info("no_add_cgroup in mount options, skip add %s into cgroup limit" % mount_uuid)
@@ -2878,16 +3066,19 @@ def add_cgroup_limit(ctx, mount_uuid, cgroup_dir=CGROUP_DIR):
         with open(oom_ctrl_path, 'w') as f:
             f.write('0')
 
-        # sort ps output by start time and reserve the latest one to avoid failure in upgrade
-        cmd = "ps -eww -o pid,start_time,cmd,args --sort=start_time | grep efc | grep mount_uuid=%s | grep -vw grep | awk '{print $1}'" % mount_uuid
-        pids = os.popen(cmd).read()
-        if pids.endswith('\n'):
-            pids = pids[:-1]
+        if efc_pid is None:
+            probe = efc_process.probe_efc(mount_uuid, EFC_WORKSPACE_DIR)
+            if probe.state == efc_process.EFC_RUNNING:
+                efc_pid = probe.owner_pid
 
-        pid = pids.split('\n')[-1]
+        if not efc_pid or efc_pid <= 1:
+            logging.warning(
+                'get EFC pid from lock owner failed, uuid %s, '
+                'skip adding pid to cgroup procs' % mount_uuid)
+            return
 
         with open(procs_path, 'a') as f:
-            f.write(pid)
+            f.write(str(efc_pid))
 
     except Exception as e:
         logging.warning('add cgroup memory limit failed, uuid %s, %s, failure ignored' % (mount_uuid, str(e)))
@@ -2927,6 +3118,23 @@ def parse_json_file(path):
             return conf
     except (ValueError, IOError) as e:
         logging.error('Load conf %s failed, error %s', path, str(e))
+    return None
+
+def get_node_id():
+    """Get node id from lingjun_config file or environment variable NODE_ID"""
+
+    # 1. try get from config file (single tenant)
+    config = parse_json_file(LINGJUN_CONFIG_PATH)
+    if config and 'NodeId' in config:
+        logging.info('Read node_id from %s: %s', LINGJUN_CONFIG_PATH, config['NodeId'])
+        return config['NodeId']
+    # 2. try get from env var (multi tenant)
+    node_id = os.environ.get(NODE_ID_ENV_VAR)
+    if node_id:
+        logging.info('Read node_id from env %s: %s', NODE_ID_ENV_VAR, node_id)
+        return node_id
+
+    logging.warning('Failed to get node_id from %s or env %s', LINGJUN_CONFIG_PATH, NODE_ID_ENV_VAR)
     return None
 
 def check_kernel_version_for_unas(options):
@@ -3562,7 +3770,7 @@ def main():
         fatal_error('Do not support space in path now')
 
     logging.info('Mount request: options=%s dns_name=%s, fs_id=%s, path=%s, mountpoint=%s',
-                options, dns_name, fs_id, path, mountpoint)
+                sanitize_options_for_log(options), dns_name, fs_id, path, mountpoint)
     check_unsupported_options(options)
 
     init_system = get_init_system()

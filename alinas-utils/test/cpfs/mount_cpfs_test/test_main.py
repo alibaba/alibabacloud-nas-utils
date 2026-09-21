@@ -25,7 +25,9 @@ def _test_main(mocker, mode, root=True):
         mocker.patch('os.geteuid', return_value=100)
 
     mount_cpfs.TLS_ENABLED = True
-    read_config_mock = mocker.patch('cpfs_nfs_common.read_config', return_value='config')
+    mock_config = mocker.MagicMock()
+    mock_config.getint.return_value = 30
+    read_config_mock = mocker.patch('cpfs_nfs_common.read_config', return_value=mock_config)
     bootstrap_logging_mock = mocker.patch('cpfs_nfs_common.bootstrap_logging')
     check_unsupported_options_mock = mocker.patch('mount_cpfs.check_unsupported_options')
     get_init_system_mock = mocker.patch('mount_cpfs.get_init_system', return_value='init')
@@ -34,6 +36,7 @@ def _test_main(mocker, mode, root=True):
                                         return_value=('dns', 'fs', 'path', 'mp', options))
     mount_tls_mock = mocker.patch('mount_cpfs.mount_tls')
     mount_nfs_directly_mock = mocker.patch('mount_cpfs.mount_nfs_directly')
+    resolve_dns_mock = mocker.patch('cpfs_nfs_common.resolve_cpfs_dns', return_value=('10.0.0.1', '10.0.0.2'))
 
     mount_cpfs.main()
 
@@ -49,7 +52,7 @@ def _test_main(mocker, mode, root=True):
         mount_tls_mock.assert_called_once()
 
         ctx = mount_tls_mock.call_args[0][0]
-        assert ctx.config == 'config'
+        assert ctx.config == mock_config
         assert ctx.init_system == 'init'
         assert ctx.dns == 'dns'
         assert ctx.path == 'path'
@@ -58,8 +61,9 @@ def _test_main(mocker, mode, root=True):
         assert ctx.options == options
     elif mode == 'direct':
         mount_tls_mock.assert_not_called()
+        resolve_dns_mock.assert_called_once_with('dns')
         mount_nfs_directly_mock.assert_called_once()
-        mount_nfs_directly_mock.assert_called_with('dns', 'path', 'mp', options)
+        mount_nfs_directly_mock.assert_called_with('10.0.0.1', 'path', 'mp', options)
     else:
         mount_nfs_directly_mock.assert_not_called()
         mount_tls_mock.assert_not_called()

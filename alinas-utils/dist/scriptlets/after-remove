@@ -6,7 +6,6 @@ reload() {
         systemctl daemon-reload
         systemctl reset-failed
     fi
-    ps -eww -o pid,cmd,args | grep /usr/local/nas-agent/nas-agent | grep -vw grep | awk '{print $1}' | xargs -I {} kill -9 {}
 }
 
 if [ "$1" = "remove" ]; then
